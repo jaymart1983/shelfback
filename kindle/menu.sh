@@ -1897,24 +1897,28 @@ remote_clients() {
     printf '%s' "$_rc_n"
 }
 
+# Both servers on one line, each saying where it is or that it is not there:
+#   Logs (2121), Dev (Off)      the usual state
+#   Logs (2121), Dev (2122)     dev access on
+#   Logs (Off),  Dev (Off)      the log server turned off in config
+# A server that is listening but firewalled says so instead of giving a port
+# nothing can connect to -- that state cost a morning once.
 remote_text() {
-    _rt_c=$(remote_clients)
+    # fw_is_open returns 2 for "no iptables here, cannot tell", which is not
+    # the same as "blocked" -- only a definite 1 means the port is shut.
+    if log_ftp_running; then
+        fw_is_open "$REMOTE_LOG_PORT"; _rt_f=$?
+        if [ "$_rt_f" = 1 ]; then _rt_l="blocked"; else _rt_l=$REMOTE_LOG_PORT; fi
+    elif log_ftp_wanted; then _rt_l="starting"
+    else _rt_l="Off"; fi
+
     if remote_running; then
-        if [ "${_rt_c:-0}" -gt 0 ]; then printf 'DEV IN USE by %s' "$_rt_c"
-        elif ! fw_is_open "$REMOTE_DEV_PORT"; then printf 'dev on, firewalled'
-        else printf 'dev rw :%s' "$REMOTE_DEV_PORT"
-        fi
-    elif remote_wanted; then
-        printf 'dev on, not answering'
-    elif log_ftp_running; then
-        if [ "${_rt_c:-0}" -gt 0 ]; then printf 'LOGS IN USE by %s' "$_rt_c"
-        else printf 'logs ro :%s' "$REMOTE_LOG_PORT"
-        fi
-    elif log_ftp_wanted; then
-        printf 'starting'
-    else
-        printf 'off'
-    fi
+        fw_is_open "$REMOTE_DEV_PORT"; _rt_f=$?
+        if [ "$_rt_f" = 1 ]; then _rt_d="blocked"; else _rt_d=$REMOTE_DEV_PORT; fi
+    elif remote_wanted; then _rt_d="starting"
+    else _rt_d="Off"; fi
+
+    printf 'Logs (%s), Dev (%s)' "$_rt_l" "$_rt_d"
 }
 
 device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
@@ -1934,14 +1938,17 @@ ULOG=${ULOG:-/mnt/us/kfx-update.log}
 
 installed_version() { cat "${BASE:-/mnt/us/extensions/kfx-sync}/VERSION" 2>/dev/null; }
 
-# One line for the panel: what the updater is doing, in a few words.
+# One line for the panel. The updater writes its own state in words meant to be
+# read here, so this mostly passes it through -- an announced update is the one
+# case worth adding to, because when it installs matters as much as that it can.
 update_panel_text() {
     [ -f "$UPDATER" ] || { printf 'not installed'; return; }
     _up_a=$(update_available)
-    if [ -n "$_up_a" ]; then printf '%s %s' "$_up_a" "$(update_due_text)"; return; fi
-    case "$(update_status)" in
-        'up to date'|'') printf 'up to date' ;;
-        *) printf '%s' "$(update_status)" ;;
+    if [ -n "$_up_a" ]; then printf 'update available (%s) %s' "$_up_a" "$(update_due_text)"; return; fi
+    _up_s=$(update_status)
+    case "$_up_s" in
+        '') printf 'checking' ;;        # started, nothing reported yet
+        *)  printf '%s' "$_up_s" ;;
     esac
 }
 update_available()  { cat "$UPDATE_AVAIL" 2>/dev/null; }
@@ -2280,7 +2287,11 @@ draw() {
     two ' daemon:'   "$_dst"       'monitor:'  "$(monitor_text)"
     if monitor_on; then _nxt=$(fmt_clock "$(state_get NEXT_SYNC)"); else _nxt="--:--:--"; fi
     two ' last sync:' "$(fmt_clock "$(state_get LAST_SYNC)")" 'next sync:' "$_nxt"
-    two ' updates:'  "$(update_panel_text)" 'ftp:' "$(remote_text)"
+    # Updates gets the full width: "update available (09122026.1100) in 5m" is
+    # longer than half a screen. The address shares a row with the FTP ports,
+    # because neither is useful without the other.
+    two ' updates:'  "$(update_panel_text)" '' ''
+    two ' ip:'       "$(stat_or "$(device_ip)")" 'ftp:' "$(remote_text)"
     # Someone reading or writing this Kindle's storage is worth more than a
     # column: it is a server with no password, and the owner should be able to
     # see it is in use without going looking.

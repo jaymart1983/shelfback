@@ -187,7 +187,7 @@ announce() {   # $1 = the version found
     mkdir -p "$(dirname "$UPDATE_AVAIL")" 2>/dev/null
     printf '%s\n' "$1" > "$UPDATE_AVAIL"
     [ -f "$UPDATE_DUE" ] || printf '%s\n' "$(( $(date +%s) + UPDATE_DELAY ))" > "$UPDATE_DUE"
-    set_state "update $1 available"
+    set_state "update available ($1)"
 }
 forget_update() { rm -f "$UPDATE_AVAIL" "$UPDATE_DUE" "$UPDATE_GO" 2>/dev/null; }
 
@@ -199,7 +199,7 @@ forget_update() { rm -f "$UPDATE_AVAIL" "$UPDATE_DUE" "$UPDATE_GO" 2>/dev/null; 
 check_once() {
     _co_have=$(local_version); _co_want=$(remote_version)
     if [ -z "$_co_want" ]; then
-        set_state "could not reach the update source"
+        set_state "error connecting"
         [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "unreachable" ] || ulog "could not reach $UPDATE_URL"
         printf 'unreachable\n' > "$UPDATE_SEEN" 2>/dev/null
         return 1
@@ -208,11 +208,11 @@ check_once() {
     # file is not what we think it is.
     case "$_co_want" in
         *[!0-9.]*|'') say "refusing a version that is not a build stamp: $_co_want"
-                      set_state "the published version is not a build stamp"; return 1 ;;
+                      set_state "error: bad version published"; return 1 ;;
     esac
     if [ "$_co_want" = "$_co_have" ]; then
         forget_update
-        set_state "up to date"
+        set_state "up to date (connected)"
         [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "$_co_want" ] || ulog "up to date ($_co_have)"
         printf '%s\n' "$_co_want" > "$UPDATE_SEEN" 2>/dev/null
         return 0
@@ -229,11 +229,11 @@ install_now() {
     [ -n "$_in_want" ] || return 1
     case "$_in_want" in *[!0-9.]*) forget_update; return 1 ;; esac
     say "installing $(local_version) -> $_in_want"
-    set_state "installing $_in_want"
-    fetch_all    || { set_state "download failed"; say "download failed"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
-    verify_stage || { set_state "the download did not verify"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
+    set_state "installing ($_in_want)"
+    fetch_all    || { set_state "error downloading"; say "download failed"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
+    verify_stage || { set_state "error: download did not verify"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
     stage_matches "$_in_want" || {
-        set_state "waiting: the release is still publishing"
+        set_state "waiting, release still publishing"
         rm -rf "$STAGE"; rm -f "$UPDATE_GO"
         # Not a failure of ours, and not permanent: drop the announcement so
         # the next check re-reads both and announces again when they agree.
@@ -241,12 +241,12 @@ install_now() {
         return 1
     }
     install_stage "$_in_want" || {
-        set_state "install failed, rolled back"; roll_back; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1
+        set_state "error: install failed, rolled back"; roll_back; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1
     }
     rm -rf "$STAGE"
     if restart_sync; then
         say "installed $_in_want and restarted the sync daemon"
-        set_state "installed $_in_want"
+        set_state "installed ($_in_want)"
         forget_update
         printf '%s\n' "$_in_want" > "$UPDATE_SEEN" 2>/dev/null
     else
@@ -254,7 +254,7 @@ install_now() {
         roll_back
         if restart_sync; then say "back on $(local_version)"
         else say "ROLLBACK DID NOT START EITHER -- needs a USB cable"; fi
-        set_state "rolled back: $_in_want would not run"
+        set_state "rolled back, $_in_want would not run"
         forget_update
         return 1
     fi
