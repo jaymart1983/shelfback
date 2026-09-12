@@ -22,7 +22,8 @@
 
 BASE=${BASE:-/mnt/us/extensions/kfx-sync}
 PIDFILE=${PIDFILE:-/var/local/kfx-daemon.pid}
-DLOG=${DLOG:-/mnt/us/kfx-daemon.log}
+LOGDIR=${LOGDIR:-/mnt/us/kfx-logs}
+DLOG=${DLOG:-$LOGDIR/daemon.log}
 
 # A short tick so a newly shared book is noticed quickly, the panel stays
 # current, and a remote request from the receiver is picked up within seconds.
@@ -85,7 +86,7 @@ RECOVER_MAX_DAY=${RECOVER_MAX_DAY:-12}
 RECOVER_MAX_PER_BOOK=${RECOVER_MAX_PER_BOOK:-2}
 RECOVER_SETTLE=${RECOVER_SETTLE:-90}   # let the framework come back up
 
-RECOVERLOG=${RECOVERLOG:-/mnt/us/kfx-recoveries.log}
+RECOVERLOG=${RECOVERLOG:-$LOGDIR/recoveries.log}
 
 # A document on the home screen is the only "is it running?" indicator the
 # Kindle UI can give us, so the daemon publishes its log as one. It appears
@@ -341,8 +342,11 @@ loop() {
             DO_CLOUD=; DO_RESEND=; DO_PURGE=; DO_SWEEP=
             drop_lock
             maybe_recover_wedge
-        remote_ensure        # put dev FTP back if the toggle is on -- the
-                             # framework restart that clears a jam kills it
+        # Both servers: the framework restart that clears a jam kills
+        # anything the menu started, and the read-only log server is supposed
+        # to be there whenever the device is.
+        log_ftp_ensure
+        remote_ensure
         else
             # The menu is driving. Stay out of its way rather than racing it.
             dlog "skipped: $(lock_holder) holds the run lock"

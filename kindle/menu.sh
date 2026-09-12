@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09122026.0953   # published by publish.sh
+KFX_BUILD=09122026.1029   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -54,7 +54,19 @@ TAGW=${TAGW:-16}                # widest tag is "sent to receiver"
 # represent characters like an en-dash and substitutes "?", so a title read off
 # disk never byte-matches the name recorded at upload time and the book looks
 # perpetually pending. The ASIN is ASCII and survives that intact.
-LOG="$OUT/sync.log"; SPOOL=/tmp/kfxsync.spool
+# One directory holding every log, and nothing else. It is what the read-only
+# FTP server serves, so what goes in here is what anyone on the network can
+# read: logs and the book state, never cwa.conf, never the books themselves.
+LOGDIR=${LOGDIR:-/mnt/us/kfx-logs}
+mkdir -p "$LOGDIR" 2>/dev/null
+# The logs used to be scattered across /mnt/us. Move them in once, keeping the
+# history rather than starting fresh.
+for _lm in "$OUT/sync.log:sync.log" /mnt/us/kfx-daemon.log:daemon.log \
+           /mnt/us/kfx-update.log:update.log /mnt/us/kfx-recoveries.log:recoveries.log; do
+    _lm_f=${_lm%%:*}; _lm_t=${_lm##*:}
+    [ -f "$_lm_f" ] && [ ! -f "$LOGDIR/$_lm_t" ] && mv "$_lm_f" "$LOGDIR/$_lm_t" 2>/dev/null
+done
+LOG="$LOGDIR/sync.log"; SPOOL=/tmp/kfxsync.spool
 mkdir -p "$OUT"; touch "$LOG"; rm -f "$SPOOL"
 
 # The one record per book. It lives next to sync.log rather than in
@@ -1736,27 +1748,139 @@ boot_hook_state() {
     fi
 }
 
-# ---------------- remote access, for development ----------------
-# There is no SSH on this device (no dropbear, no sshd) and installing usbnet
-# is a separate job. busybox does carry ftpd, so Settings can put an FTP server
-# on /mnt/us for a while: enough to pull the log and push a test script without
-# unplugging the Kindle and mounting it.
+# ---------------- remote access ----------------
+# Two FTP servers, because they answer two different needs and carry two very
+# different risks.
 #
-# OFF by default. ftpd here runs as root with no password -- anyone on the same
-# network can read and write /mnt/us while it is on -- so Settings says so
-# plainly and asks before starting it.
+#   logs  READ-ONLY, always on, serving $LOGDIR and nothing else. Enough to
+#         see what the device has been doing from a laptop. busybox ftpd is
+#         read-only unless given -w, so this is not a policy we enforce -- it
+#         is a capability the server does not have.
 #
-# It is a toggle: on stays on until it is turned off, because "pull the log
-# after the next jam" can mean waiting hours. The ON state is a file in
-# STATEDIR rather than a variable, for two reasons: clearing a jam restarts the
-# UI framework, which kills the menu and anything it started, and a reboot
-# should not quietly reopen the device. The daemon reads the flag and puts the
-# server back after a restart; nothing puts it back after a reboot unless the
-# flag is still there, which is the point of it being persistent and visible.
-REMOTE_PORT=${REMOTE_PORT:-2121}
-REMOTE_UNTIL=${REMOTE_UNTIL:-/tmp/kfx-remote.until}
-REMOTE_PIDS=${REMOTE_PIDS:-/tmp/kfx-remote.pids}
+#   dev   READ-WRITE, off by default, serving all of /mnt/us. This is how a
+#         test script gets onto the device without a cable, and it is also
+#         root access to everything on it: books, cwa.conf with the Calibre
+#         password, the lot. Its own port, its own toggle, and it says so.
+#
+# Neither reaches the network on its own. Measured 12 Sep 2026: this Kindle's
+# INPUT chain is policy DROP, accepting only port 40317 (Amazon's own service)
+# and RELATED/ESTABLISHED traffic. tcpsvd was listening and answering on
+# 127.0.0.1 for a morning while every packet from the LAN was dropped. So a
+# port is opened in the firewall when its server starts and closed when it
+# stops -- never left open without something behind it.
+REMOTE_LOG_PORT=${REMOTE_LOG_PORT:-2121}
+REMOTE_DEV_PORT=${REMOTE_DEV_PORT:-2122}
+REMOTE_PIDS=${REMOTE_PIDS:-/tmp/kfx-remote.pids}       # the dev server
+REMOTE_LOG_PIDS=${REMOTE_LOG_PIDS:-/tmp/kfx-remotelog.pids}
 REMOTE_FLAG=${REMOTE_FLAG:-${STATEDIR:-/var/local/kfx-state}/REMOTE_ON}
+REMOTE_LOG_OFF=${REMOTE_LOG_OFF:-${STATEDIR:-/var/local/kfx-state}/REMOTE_LOG_OFF}
+
+IPTABLES=${IPTABLES:-iptables}
+NETSTAT=${NETSTAT:-netstat}
+
+# "A process is alive" is not "a port is bound" -- a super-server that starts
+# and fails to bind stays alive just long enough to look like success. Ask the
+# kernel instead.
+port_listening() {   # $1 = port
+    command -v "$NETSTAT" >/dev/null 2>&1 || return 2   # cannot tell
+    "$NETSTAT" -ln 2>/dev/null | grep -q "[:.]$1[^0-9]" && return 0
+    return 1
+}
+pids_alive() {   # $1 = pid file
+    [ -s "$1" ] || return 1
+    while read -r _pa_p; do kill -0 "$_pa_p" 2>/dev/null && return 0; done < "$1"
+    return 1
+}
+server_up() {   # $1 = port, $2 = pid file
+    port_listening "$1"
+    case "$?" in 0) return 0 ;; 1) return 1 ;; esac
+    pids_alive "$2"
+}
+
+fw_open() {   # $1 = port
+    command -v "$IPTABLES" >/dev/null 2>&1 || return 1
+    fw_close "$1"                                   # never stack duplicates
+    "$IPTABLES" -I INPUT 1 -p tcp --dport "$1" -j ACCEPT 2>/dev/null
+}
+fw_close() {   # $1 = port -- -D removes one rule and fails when none are left
+    command -v "$IPTABLES" >/dev/null 2>&1 || return 0
+    _fc_n=0
+    while [ "$_fc_n" -lt 8 ]; do
+        "$IPTABLES" -D INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null || break
+        _fc_n=$((_fc_n + 1))
+    done
+    return 0
+}
+fw_is_open() {   # $1 = port
+    command -v "$IPTABLES" >/dev/null 2>&1 || return 2
+    "$IPTABLES" -L INPUT -n 2>/dev/null | grep -q "dpt:$1" && return 0
+    return 1
+}
+
+# busybox ftpd needs a super-server in front of it. tcpsvd is what this device
+# has; nc can do it too on builds with -e. Verified by the port, not the pid.
+ftp_serve() {   # $1 = port, $2 = pid file, $3.. = ftpd arguments
+    _fs_port=$1; _fs_pids=$2; shift 2
+    command -v ftpd >/dev/null 2>&1 || { REMOTE_HOW="no ftpd on this device"; return 1; }
+    REMOTE_HOW=""
+    for _fs_m in tcpsvd nc; do
+        command -v "$_fs_m" >/dev/null 2>&1 || continue
+        : > "$_fs_pids"
+        case "$_fs_m" in
+            tcpsvd) setsid tcpsvd -vE 0.0.0.0 "$_fs_port" ftpd "$@" >/dev/null 2>&1 & ;;
+            nc)     setsid nc -ll -p "$_fs_port" -e ftpd "$@" >/dev/null 2>&1 & ;;
+        esac
+        echo $! >> "$_fs_pids"
+        sleep 2
+        if server_up "$_fs_port" "$_fs_pids"; then
+            REMOTE_HOW="$_fs_m"
+            fw_open "$_fs_port" || REMOTE_HOW="$_fs_m (could not open the firewall)"
+            return 0
+        fi
+        while read -r _fs_p; do kill "$_fs_p" 2>/dev/null; done < "$_fs_pids" 2>/dev/null
+        rm -f "$_fs_pids"
+    done
+    REMOTE_HOW="nothing could listen on $_fs_port"
+    return 1
+}
+
+ftp_unserve() {   # $1 = port, $2 = pid file
+    [ -s "$2" ] && while read -r _fu_p; do kill "$_fu_p" 2>/dev/null; done < "$2"
+    rm -f "$2"
+    # Close the hole even if the server was already gone: a crash between
+    # starting and stopping must not leave a port open with nothing behind it.
+    fw_close "$1"
+}
+
+# --- the read-only log server -------------------------------------------
+log_ftp_running() { server_up "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; }
+log_ftp_wanted()  { [ ! -f "$REMOTE_LOG_OFF" ]; }
+log_ftp_stop()    { ftp_unserve "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; }
+log_ftp_ensure() {
+    log_ftp_wanted || { log_ftp_running && log_ftp_stop; return 0; }
+    log_ftp_running && return 0
+    mkdir -p "$LOGDIR" 2>/dev/null
+    # No -w. The server cannot write, whatever the client asks for.
+    ftp_serve "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS" "$LOGDIR" || return 1
+    emit "logs readable at ftp://$(device_ip):$REMOTE_LOG_PORT/ (read-only)"
+    return 0
+}
+
+# --- the read-write dev server ------------------------------------------
+remote_running()  { server_up "$REMOTE_DEV_PORT" "$REMOTE_PIDS"; }
+remote_wanted()   { [ -f "$REMOTE_FLAG" ]; }
+remote_want_on()  { mkdir -p "$(dirname "$REMOTE_FLAG")" 2>/dev/null; : > "$REMOTE_FLAG"; }
+remote_want_off() { rm -f "$REMOTE_FLAG" 2>/dev/null; }
+remote_stop()     { ftp_unserve "$REMOTE_DEV_PORT" "$REMOTE_PIDS"; }
+remote_start()    { ftp_serve "$REMOTE_DEV_PORT" "$REMOTE_PIDS" -w /mnt/us; }
+remote_ensure() {
+    remote_wanted || return 0
+    remote_running && return 0
+    if remote_start; then
+        emit "dev access: ftp://$(device_ip):$REMOTE_DEV_PORT/ read-write, via $REMOTE_HOW"
+    fi
+    return 0
+}
 
 # tcpsvd runs one ftpd per connection, so a live ftpd that is not the
 # super-server itself IS someone connected. Counting processes rather than
@@ -1766,7 +1890,6 @@ remote_clients() {
     _rc_n=0
     for _rc_d in "${PROCDIR:-/proc}"/[0-9]*; do
         grep -qa 'ftpd' "$_rc_d/cmdline" 2>/dev/null || continue
-        # the listener's own command line names ftpd as its argument
         grep -qa 'tcpsvd' "$_rc_d/cmdline" 2>/dev/null && continue
         grep -qa 'inetd'  "$_rc_d/cmdline" 2>/dev/null && continue
         _rc_n=$((_rc_n + 1))
@@ -1774,112 +1897,24 @@ remote_clients() {
     printf '%s' "$_rc_n"
 }
 
-remote_wanted()  { [ -f "$REMOTE_FLAG" ]; }
-remote_want_on() { mkdir -p "$(dirname "$REMOTE_FLAG")" 2>/dev/null; : > "$REMOTE_FLAG"; }
-remote_want_off(){ rm -f "$REMOTE_FLAG" 2>/dev/null; }
-
-# "A process exists" is not "a server is listening". The first version checked
-# only that the pid it backgrounded was alive, so a super-server that started
-# and failed to bind still reported an address the menu happily printed -- and
-# nothing answered on the port. Ask the kernel instead.
-NETSTAT=${NETSTAT:-netstat}
-remote_listening() {
-    command -v "$NETSTAT" >/dev/null 2>&1 || return 2   # cannot tell
-    "$NETSTAT" -ln 2>/dev/null | grep -q "[:.]$REMOTE_PORT[^0-9]" && return 0
-    return 1
-}
-
-remote_running() {
-    # If netstat can answer, its answer is the truth.
-    remote_listening
-    case "$?" in 0) return 0 ;; 1) return 1 ;; esac
-    [ -s "$REMOTE_PIDS" ] || return 1
-    while read -r _rr_p; do kill -0 "$_rr_p" 2>/dev/null && return 0; done < "$REMOTE_PIDS"
-    return 1
-}
-
-remote_stop() {
-    [ -s "$REMOTE_PIDS" ] && while read -r _rs_p; do kill "$_rs_p" 2>/dev/null; done < "$REMOTE_PIDS"
-    rm -f "$REMOTE_PIDS" "$REMOTE_UNTIL"
-}
-
-# busybox ftpd expects to be handed a connected socket, so it needs a small
-# super-server in front. Whichever of these this build has, we use.
-# busybox ftpd expects to be handed a connected socket, so it needs something in
-# front of it. Try each thing this build might have, and believe none of them
-# until the port is actually listening.
-remote_start() {
-    command -v ftpd >/dev/null 2>&1 || { REMOTE_HOW="no ftpd on this device"; return 1; }
-    REMOTE_TRIED=""
-    for _rs_m in tcpsvd inetd nc; do
-        command -v "$_rs_m" >/dev/null 2>&1 || continue
-        : > "$REMOTE_PIDS"
-        case "$_rs_m" in
-            tcpsvd) setsid tcpsvd -vE 0.0.0.0 "$REMOTE_PORT" ftpd -w /mnt/us >/dev/null 2>&1 &
-                    echo $! >> "$REMOTE_PIDS" ;;
-            inetd)  printf '%s stream tcp nowait root ftpd ftpd -w /mnt/us\n' "$REMOTE_PORT" \
-                        > /tmp/kfx-inetd.conf
-                    setsid inetd -f /tmp/kfx-inetd.conf >/dev/null 2>&1 &
-                    echo $! >> "$REMOTE_PIDS" ;;
-            # Last resort: nc as its own super-server. -ll re-listens after each
-            # client; builds without -e cannot do this and simply fail here,
-            # which is why it is tried last and still verified below.
-            nc)     setsid nc -ll -p "$REMOTE_PORT" -e ftpd -w /mnt/us >/dev/null 2>&1 &
-                    echo $! >> "$REMOTE_PIDS" ;;
-        esac
-        REMOTE_TRIED="$REMOTE_TRIED $_rs_m"
-        sleep 2
-        if remote_running; then REMOTE_HOW="$_rs_m"; return 0; fi
-        # Did not bind: clean up before trying the next one, or the failed
-        # process lingers and the pid file lies about which server is which.
-        while read -r _rs_p; do kill "$_rs_p" 2>/dev/null; done < "$REMOTE_PIDS" 2>/dev/null
-        rm -f "$REMOTE_PIDS"
-    done
-    if [ -n "$REMOTE_TRIED" ]; then
-        REMOTE_HOW="tried$REMOTE_TRIED -- none of them listened on $REMOTE_PORT"
-    else
-        REMOTE_HOW="nothing on this device can host ftpd (no tcpsvd, inetd or nc)"
-    fi
-    return 1
-}
-
-# From the daemon tick: if the toggle is on and the server is not up, put it
-# back. This is what survives the framework restart that clears a jam -- the
-# menu and its child processes do not.
-remote_ensure() {
-    remote_wanted || return 0
-    remote_running && return 0
-    if remote_start; then
-        emit "remote access: ftp on $(device_ip):$REMOTE_PORT via $REMOTE_HOW"
-    fi
-    return 0
-}
-# Three states worth telling apart: off; on and serving; and wanted but not
-# serving, which is what a failed start or a lost wifi connection looks like.
 remote_text() {
+    _rt_c=$(remote_clients)
     if remote_running; then
-        _rt_c=$(remote_clients)
-        if [ "${_rt_c:-0}" -gt 0 ]; then
-            printf 'IN USE by %s' "$_rt_c"
-        else
-            printf 'on %s:%s' "$(device_ip)" "$REMOTE_PORT"
+        if [ "${_rt_c:-0}" -gt 0 ]; then printf 'DEV IN USE by %s' "$_rt_c"
+        elif ! fw_is_open "$REMOTE_DEV_PORT"; then printf 'dev on, firewalled'
+        else printf 'dev rw :%s' "$REMOTE_DEV_PORT"
         fi
     elif remote_wanted; then
-        printf 'on, not answering'
+        printf 'dev on, not answering'
+    elif log_ftp_running; then
+        if [ "${_rt_c:-0}" -gt 0 ]; then printf 'LOGS IN USE by %s' "$_rt_c"
+        else printf 'logs ro :%s' "$REMOTE_LOG_PORT"
+        fi
+    elif log_ftp_wanted; then
+        printf 'starting'
     else
         printf 'off'
     fi
-}
-
-# One line for the panel: what the updater is doing, in a few words.
-update_panel_text() {
-    [ -f "$UPDATER" ] || { printf 'not installed'; return; }
-    _up_a=$(update_available)
-    if [ -n "$_up_a" ]; then printf '%s %s' "$_up_a" "$(update_due_text)"; return; fi
-    case "$(update_status)" in
-        'up to date'|'') printf 'up to date' ;;
-        *) printf '%s' "$(update_status)" ;;
-    esac
 }
 
 device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
@@ -1898,6 +1933,17 @@ UPDATE_STATE=${UPDATE_STATE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_STATE}
 ULOG=${ULOG:-/mnt/us/kfx-update.log}
 
 installed_version() { cat "${BASE:-/mnt/us/extensions/kfx-sync}/VERSION" 2>/dev/null; }
+
+# One line for the panel: what the updater is doing, in a few words.
+update_panel_text() {
+    [ -f "$UPDATER" ] || { printf 'not installed'; return; }
+    _up_a=$(update_available)
+    if [ -n "$_up_a" ]; then printf '%s %s' "$_up_a" "$(update_due_text)"; return; fi
+    case "$(update_status)" in
+        'up to date'|'') printf 'up to date' ;;
+        *) printf '%s' "$(update_status)" ;;
+    esac
+}
 update_available()  { cat "$UPDATE_AVAIL" 2>/dev/null; }
 update_status()     { cat "$UPDATE_STATE" 2>/dev/null; }
 
@@ -2134,7 +2180,8 @@ settings_menu() {
         printf '   4) Recovery history\n'
         printf '   5) Restart UI now (clears stuck downloads)\n'
         printf '   6) Calibre login\n'
-        printf '   7) Remote access (dev): %s\n' "$(remote_text)"
+        printf '   7) Dev FTP (read-write, port %s): %s\n' \
+        "$REMOTE_DEV_PORT" "$(remote_wanted && echo ON || echo off)"
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -2152,21 +2199,23 @@ settings_menu() {
             7) clear 2>/dev/null; echo
                if remote_wanted; then
                    remote_want_off; remote_stop
-                   emit "remote access: turned off"
-                   printf '   remote access is off\n'
+                   emit "dev access: turned off"
+                   printf '   Dev access is off.\n'
+                   printf '   Logs stay readable on port %s.\n' "$REMOTE_LOG_PORT"
                else
-                   printf '   Puts an FTP server on this Kindle, serving /mnt/us,\n'
-                   printf '   for pulling logs and pushing test scripts.\n\n'
-                   printf '   It runs as root with NO password: anyone on this\n'
-                   printf '   network can read and write /mnt/us while it is on.\n'
-                   printf '   It stays on until you turn it off here.\n\n'
+                   printf '   Opens a SECOND FTP server on port %s, serving\n' "$REMOTE_DEV_PORT"
+                   printf '   all of /mnt/us, READ AND WRITE, as root with no\n'
+                   printf '   password. That is every book on the device, and\n'
+                   printf '   cwa.conf with your Calibre password in it.\n\n'
+                   printf '   The read-only log server on %s is unaffected.\n' "$REMOTE_LOG_PORT"
+                   printf '   This stays on until you turn it off here.\n\n'
                    printf '   type YES to turn it on > '
                    read _ra 2>/dev/null
                    if [ "$_ra" = "YES" ]; then
                        remote_want_on
                        if remote_start; then
-                           emit "remote access: ftp on $(device_ip):$REMOTE_PORT via $REMOTE_HOW"
-                           printf '\n   on (%s): ftp://%s:%s/\n' "$REMOTE_HOW" "$(device_ip)" "$REMOTE_PORT"
+                           emit "dev access: ftp://$(device_ip):$REMOTE_DEV_PORT/ read-write, via $REMOTE_HOW"
+                           printf '\n   on (%s): ftp://%s:%s/\n' "$REMOTE_HOW" "$(device_ip)" "$REMOTE_DEV_PORT"
                            printf '   it stays on, through a UI restart, until turned off\n'
                        else
                            printf '\n   could not start: %s\n' "$REMOTE_HOW"
@@ -2236,9 +2285,9 @@ draw() {
     # column: it is a server with no password, and the owner should be able to
     # see it is in use without going looking.
     _dr_c=$(remote_clients)
-    if remote_running && [ "${_dr_c:-0}" -gt 0 ]; then
-        printf ' >> FTP IN USE: %s connection(s) to %s:%s\n' \
-            "$_dr_c" "$(device_ip)" "$REMOTE_PORT"
+    if [ "${_dr_c:-0}" -gt 0 ] && remote_running; then
+        printf ' >> DEV FTP IN USE (read-write): %s connection(s) to %s:%s\n' \
+            "$_dr_c" "$(device_ip)" "$REMOTE_DEV_PORT"
     fi
     rule
     # Books.
@@ -2257,12 +2306,12 @@ draw() {
     printf ' 3) Books\n'
     [ "$(state_get N_PROBLEMS)" -gt 0 ] 2>/dev/null && printf ' 4) View problems\n'
     _mm_up=$(update_available)
-    [ -n "$_mm_up" ] && printf ' 5) Install update %s (otherwise %s)\n' \
-        "$_mm_up" "$(update_due_text)"
+    [ -n "$_mm_up" ] && printf '%s\n' \
+        "$(short " 5) Install update $_mm_up (otherwise $(update_due_text))" "$W")"
     echo
     if [ "$(installed_version)" != "$KFX_BUILD" ] && [ -n "$(installed_version)" ]; then
-        printf ' ! running %s, %s is installed -- close and reopen\n' \
-            "$KFX_BUILD" "$(installed_version)"
+        printf '%s\n' \
+            "$(short " ! running $KFX_BUILD, $(installed_version) installed -- reopen" "$W")"
     fi
     printf ' U) Updates\n'
     printf ' S) Settings\n'
@@ -2279,9 +2328,13 @@ draw() {
 two() {
     _t_left=$(printf '%s %s' "$1" "$2")
     if [ -z "$3" ]; then
-        printf '%s\n' "$_t_left"
+        printf '%s\n' "$(short "$_t_left" "$W")"
     else
-        printf '%-*s%s %s\n' "$HALF" "$_t_left" "$3" "$4"
+        # Clip the left column, or a long value runs into the right one and the
+        # two columns stop lining up -- which is what a wrapped line looks like
+        # before it wraps.
+        _t_left=$(short "$_t_left" $((HALF - 1)))
+        printf '%-*s%s %s\n' "$HALF" "$_t_left" "$3" "$(short "$4" $((W - HALF - ${#3} - 2)))"
     fi
 }
 

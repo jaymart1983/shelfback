@@ -7,8 +7,15 @@
 # was still alive -- not that anything had bound the port -- so a super-server
 # that started and failed can look like success.
 #
-# This finds out which of them this Kindle actually has, tries each one, and
-# asks the kernel whether the port is listening. It stops everything it starts.
+# Then the log showed tcpsvd HAD started and reported an address. So the
+# question changed: is nothing listening, or is something listening that the
+# network cannot reach? Kindle firmware carries iptables rules that drop
+# inbound connections, which would look exactly like this -- ARP resolves, ping
+# is dropped, the port is unreachable.
+#
+# So this tries each super-server, asks the kernel whether the port is bound,
+# and then connects to it FROM THIS DEVICE. A local connection that works while
+# a remote one does not is a firewall, not a server. It stops what it starts.
 #
 # Output: /mnt/us/kfxremote.txt, and on screen.
 OUT_TXT=/mnt/us/kfxremote.txt
@@ -22,6 +29,17 @@ listening() {
     command -v netstat >/dev/null 2>&1 || { echo "no netstat"; return 2; }
     if netstat -ln 2>/dev/null | grep -q "[:.]$PORT[^0-9]"; then echo yes; return 0; fi
     echo no; return 1
+}
+
+# The decisive test: can this device talk to its own port?
+local_connect() {
+    if command -v nc >/dev/null 2>&1; then
+        if echo QUIT | nc -w 4 127.0.0.1 "$PORT" 2>/dev/null | head -2 | grep -qi 'ftp\|220'; then
+            echo "YES -- something is serving FTP locally"; return 0
+        fi
+        echo "no answer on 127.0.0.1:$PORT"; return 1
+    fi
+    echo "no nc to test with"; return 2
 }
 
 kill_all() {
@@ -97,7 +115,32 @@ kill_all() {
     fi
 
     echo
-    echo "=== 5. anything left running? ==="
+    echo "=== 5. is it the server, or the network? ==="
+    if command -v tcpsvd >/dev/null 2>&1; then
+        setsid tcpsvd -vE 0.0.0.0 "$PORT" ftpd -w /mnt/us >/tmp/kfxrt.again 2>&1 &
+        sleep 2
+        echo "  listening:        $(listening)"
+        echo "  local connect:    $(local_connect)"
+        echo "  (if local works and your laptop cannot, it is a firewall)"
+        kill_all
+    fi
+
+    echo
+    echo "=== 6. inbound firewall rules ==="
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -L INPUT -n 2>/dev/null | head -25 | sed 's/^/  /'
+    else
+        echo "  no iptables command"
+    fi
+    [ -r /proc/net/ip_tables_names ] && {
+        echo "  tables in the kernel:"; sed 's/^/    /' /proc/net/ip_tables_names; }
+
+    echo
+    echo "=== 7. does setsid exist? (the server must outlive the menu) ==="
+    printf '  setsid: %s\n' "$(command -v setsid 2>/dev/null || echo MISSING)"
+
+    echo
+    echo "=== 8. anything left running? ==="
     ps 2>/dev/null | grep -E 'tcpsvd|inetd|ftpd' | grep -v grep | sed 's/^/  /' || echo "  nothing"
     echo "  port $PORT: $(listening)"
 

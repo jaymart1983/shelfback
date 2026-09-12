@@ -134,8 +134,9 @@ again.
 - **The menu** shows Calibre's state, the background sync, counts, and a book
   list with each book's status: Queued, Downloading, Stuck, Waiting Part, Not
   Sent, Not KFX, Sent, Sent Success.
-- **The log** is on the Kindle at `/mnt/us/dedrm/sync.log`. Read it by mounting
-  the Kindle over USB.
+- **The logs** are all in `/mnt/us/kfx-logs/`: `sync.log`, `daemon.log`,
+  `update.log`, `recoveries.log`. Read them by mounting the Kindle, or over the
+  read-only FTP server described below.
 - **Build numbers** are the deploy time (`mmddyyyy.hhmm`), shown at the top
   right and in the log. The menu restarts the background sync when it finds it
   running an older build, so relaunching is enough after a deploy.
@@ -143,14 +144,21 @@ again.
   device, and tests the login straight away.
 - **U) Check for updates** asks the update daemon to look now; it also checks
   every couple of hours by itself. See [updating](#updating).
-- **Settings -> Remote access (dev)** puts an FTP server on `/mnt/us` for
-  pulling the log and pushing a test script without a USB cable. It serves as
-  root with **no password**, so it is off by default and has to be confirmed --
-  but once on it stays on until you turn it off, because waiting for the next
-  jam can take hours. The daemon puts it back after the framework restart that
-  clears a jam. The panel shows it, and says **FTP IN USE** while anyone is
-  connected. Note the Kindle leaves the network when it sleeps, so it only
-  answers while awake.
+- **Two FTP servers**, for two different needs and two very different risks:
+
+  | | Port | Serves | Writable | Default |
+  |---|---|---|---|---|
+  | logs | 2121 | `/mnt/us/kfx-logs` | no | **on** |
+  | dev | 2122 | all of `/mnt/us` | **yes** | off |
+
+  The log server is read-only because busybox `ftpd` is read-only unless given
+  `-w` -- not a rule enforced, a capability the server does not have. The dev
+  server is **Settings -> Dev FTP**, and it is root access to everything on the
+  device including `cwa.conf` and your Calibre password, so it asks first and
+  says so. Both run as root with no password; neither is reachable from
+  anywhere until its port is opened in the firewall, which happens when the
+  server starts and is undone when it stops. The panel shows which one is in
+  use.
 
 ### When something is wrong
 
@@ -227,6 +235,7 @@ hour. See [docs/design-notes.md](docs/design-notes.md).
 
 ```
 kindle/      what runs on the Kindle
+  publish.sh         stamp a release so devices can install it over the air
   KFX Sync.sh        the scriptlet, copied into documents/ as "00 KFX Sync"
   menu.json          the KUAL entry, if KUAL is installed
   launch.sh          what both of those start: opens the front end in kterm

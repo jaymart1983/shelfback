@@ -167,12 +167,47 @@ So the code carries its own version, and the two must agree: `menu.sh`'s
 half-published and the device waits for the next check. `publish.sh` stamps both
 together so they cannot drift apart in the repository.
 
-## The Kindle leaves the network when it sleeps
+## The firewall drops everything inbound
 
-The device does not answer ping at all while suspended -- not a refused
-connection, no response. So the dev FTP server only answers while the Kindle is
-awake, and "the server is down" and "the Kindle is asleep" look identical from
-a laptop. Wake it before reaching for the log.
+Measured 12 Sep 2026. `tcpsvd` was listening on 2121, `netstat` showed it
+bound, and connecting from the device itself to `127.0.0.1:2121` got an FTP
+greeting -- while no host on the LAN could reach it, and the Kindle did not
+answer ping either.
+
+```
+Chain INPUT (policy DROP)
+ACCEPT tcp dpt:40317                        <- Amazon's own service
+ACCEPT tcp state RELATED,ESTABLISHED
+ACCEPT icmp state RELATED,ESTABLISHED
+```
+
+Outbound and established traffic are fine, which is why fetching updates from
+GitHub always worked. Nothing else gets in. So any inbound server needs a rule
+of its own, opened when it starts and removed when it stops -- and a port is
+never left open with nothing behind it.
+
+This cost a morning because the failure was silent in both directions: the
+server said it had started (it had), and the client saw a timeout
+indistinguishable from a sleeping device. Two wrong diagnoses came before the
+measurement -- "the Kindle is asleep", then "tcpsvd must be missing" -- and the
+probe that answered it took ten minutes to write. It should have been written
+before the feature, not after the third guess.
+
+What the device actually has, since that is what the guesses got wrong:
+`ftpd`, `tcpsvd`, `nc` (with `-e` and `-l`), `telnetd`, `netstat`, `setsid`,
+`iptables`, busybox 1.34.1. No `httpd`, no `inetd`, no `sshd`, no `dropbear`.
+
+## Two servers, because read-only is a capability not a promise
+
+busybox `ftpd` cannot write unless given `-w`. So the always-on log server is
+not read-only by policy -- it is read-only because the program it runs has no
+way to write. It serves `/mnt/us/kfx-logs` and nothing else, which is why the
+logs were gathered into one directory: the alternative was serving `/mnt/us`,
+where `cwa.conf` holds the Calibre password.
+
+The read-write server is a separate process on a separate port with a separate
+toggle, so "let me read the log" and "let me replace the code" are never the
+same decision.
 
 ## What the Kindle can reach, and what it can host
 
