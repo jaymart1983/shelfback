@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09122026.0910   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09122026.0943   # published over the air
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -1852,6 +1852,43 @@ request_update() {
     : > "$UPDATE_REQ" 2>/dev/null || return 1
     return 0
 }
+# The front end runs from memory. An update replaces menu.sh on disk and this
+# process keeps the old code until something starts it again -- which is why an
+# over-the-air update appeared to do nothing until the script was relaunched by
+# hand. So when the installed version stops matching the build we are running,
+# restart into it.
+#
+# KFX_RELOADED survives the exec and stops this becoming a loop if the two can
+# never agree: a hand-edited VERSION, or a menu.sh the updater could not stamp.
+# One restart per version, then leave it alone and say so on the menu.
+menu_self() {
+    case "$0" in
+        *menu.sh) [ -r "$0" ] && { printf '%s' "$0"; return 0; } ;;
+    esac
+    printf '%s' "$(dirname "$CONF")/menu.sh"
+}
+
+reload_if_stale() {
+    [ -n "${KFX_BUILD:-}" ] || return 0
+    _ri_v=$(installed_version)
+    [ -n "$_ri_v" ] || return 0
+    [ "$_ri_v" = "$KFX_BUILD" ] && return 0
+    [ "${KFX_RELOADED:-}" = "$_ri_v" ] && return 1     # tried once already
+    _ri_self=$(menu_self)
+    [ -r "$_ri_self" ] || return 1
+    emit "front end restarting: $KFX_BUILD -> $_ri_v"
+    flush_log
+    clear 2>/dev/null
+    printf '\n'
+    uline "Updated to $_ri_v."
+    uline "Restarting..."
+    sleep 2
+    if [ "${KFX_RELOAD_DRYRUN:-0}" = 1 ]; then printf 'would exec %s\n' "$_ri_self"; return 0; fi
+    KFX_RELOADED=$_ri_v
+    export KFX_RELOADED
+    exec sh "$_ri_self"
+}
+
 request_install() {
     [ -f "$UPDATER" ] || return 1
     mkdir -p "$(dirname "$UPDATE_GO")" 2>/dev/null
@@ -1926,9 +1963,10 @@ install_update_screen() {
     uline "Installed: $(stat_or "$(installed_version)")"
     if [ "$(installed_version)" != "$KFX_BUILD" ]; then
         echo
-        uline "Close and reopen KFX Sync to run the new version."
+        uline "Restarting on the new version."
     fi
     echo; printf ' [enter] > '; read _x 2>/dev/null
+    # Back to the menu loop, which restarts into the new code.
 }
 
 # ---------------- calibre login ----------------
@@ -2147,6 +2185,10 @@ draw() {
     [ -n "$_mm_up" ] && printf ' 5) Install update %s (otherwise %s)\n' \
         "$_mm_up" "$(update_due_text)"
     echo
+    if [ "$(installed_version)" != "$KFX_BUILD" ] && [ -n "$(installed_version)" ]; then
+        printf ' ! running %s, %s is installed -- close and reopen\n' \
+            "$KFX_BUILD" "$(installed_version)"
+    fi
     printf ' U) Updates\n'
     printf ' S) Settings\n'
     printf ' R) Refresh\n'
@@ -2552,6 +2594,9 @@ flush_log
 UI_STEP=15
 _redraw=1; _idle=0; _since=0
 while :; do
+    # Before drawing, not after: if the code on disk is newer than this
+    # process, the screen we are about to paint is the old one.
+    reload_if_stale
     [ "$_redraw" = 1 ] && draw
     _redraw=0
     if read -t "$UI_STEP" choice 2>/dev/null; then
