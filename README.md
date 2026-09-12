@@ -121,6 +121,10 @@ again.
   running an older build, so relaunching is enough after a deploy.
 - **Settings -> Calibre login** changes the address, username or password on the
   device, and tests the login straight away.
+- **Settings -> Remote access (dev)** puts an FTP server on `/mnt/us` for 30
+  minutes, for pulling the log and pushing a test script without a USB cable.
+  It serves as root with no password, so it is off by default, has to be
+  confirmed, and stops by itself.
 
 ### When something is wrong
 

@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09112026.2010   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09112026.2111   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=/mnt/us/extensions/kfx-sync/config
 [ -r "$CONF" ] && . "$CONF"
@@ -1704,6 +1704,73 @@ boot_hook_state() {
     fi
 }
 
+# ---------------- remote access, for development ----------------
+# There is no SSH on this device (no dropbear, no sshd) and installing usbnet
+# is a separate job. busybox does carry ftpd, so Settings can put an FTP server
+# on /mnt/us for a while: enough to pull the log and push a test script without
+# unplugging the Kindle and mounting it.
+#
+# OFF by default, and it stops by itself. ftpd here runs as root with no
+# password -- anyone on the same network can read and write /mnt/us while it is
+# on -- so it is a development tool, not something to leave running.
+REMOTE_PORT=${REMOTE_PORT:-2121}
+REMOTE_MINUTES=${REMOTE_MINUTES:-30}
+REMOTE_UNTIL=${REMOTE_UNTIL:-/tmp/kfx-remote.until}
+REMOTE_PIDS=${REMOTE_PIDS:-/tmp/kfx-remote.pids}
+
+remote_running() {
+    [ -s "$REMOTE_PIDS" ] || return 1
+    while read -r _rr_p; do kill -0 "$_rr_p" 2>/dev/null && return 0; done < "$REMOTE_PIDS"
+    return 1
+}
+
+remote_stop() {
+    [ -s "$REMOTE_PIDS" ] && while read -r _rs_p; do kill "$_rs_p" 2>/dev/null; done < "$REMOTE_PIDS"
+    rm -f "$REMOTE_PIDS" "$REMOTE_UNTIL"
+}
+
+# busybox ftpd expects to be handed a connected socket, so it needs a small
+# super-server in front. Whichever of these this build has, we use.
+remote_start() {
+    command -v ftpd >/dev/null 2>&1 || { REMOTE_HOW="no ftpd on this device"; return 1; }
+    : > "$REMOTE_PIDS"
+    if command -v tcpsvd >/dev/null 2>&1; then
+        setsid tcpsvd -vE 0.0.0.0 "$REMOTE_PORT" ftpd -w /mnt/us >/dev/null 2>&1 &
+        echo $! >> "$REMOTE_PIDS"; REMOTE_HOW="tcpsvd"
+    elif command -v inetd >/dev/null 2>&1; then
+        printf '%s stream tcp nowait root ftpd ftpd -w /mnt/us\n' "$REMOTE_PORT" > /tmp/kfx-inetd.conf
+        setsid inetd -f /tmp/kfx-inetd.conf >/dev/null 2>&1 &
+        echo $! >> "$REMOTE_PIDS"; REMOTE_HOW="inetd"
+    else
+        REMOTE_HOW="no tcpsvd or inetd to host ftpd"; rm -f "$REMOTE_PIDS"; return 1
+    fi
+    sleep 1
+    remote_running || { REMOTE_HOW="$REMOTE_HOW (it did not stay up)"; rm -f "$REMOTE_PIDS"; return 1; }
+    printf '%s\n' "$(( $(date +%s) + REMOTE_MINUTES * 60 ))" > "$REMOTE_UNTIL"
+    return 0
+}
+
+# Called from the menu loop and from the daemon tick: turn it off when its time
+# is up, so a forgotten toggle cannot leave the device open indefinitely.
+remote_expire() {
+    [ -f "$REMOTE_UNTIL" ] || return 0
+    _re_u=$(cat "$REMOTE_UNTIL" 2>/dev/null)
+    case "$_re_u" in ''|*[!0-9]*) remote_stop; return 0 ;; esac
+    [ "$(date +%s)" -ge "$_re_u" ] && { emit "remote access: time is up, stopping"; remote_stop; }
+    return 0
+}
+
+remote_text() {
+    if remote_running; then
+        _rt_u=$(cat "$REMOTE_UNTIL" 2>/dev/null)
+        printf 'on until %s, ftp %s:%s' "$(fmt_clock "$_rt_u")" "$(device_ip)" "$REMOTE_PORT"
+    else
+        printf 'off'
+    fi
+}
+
+device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
+
 # ---------------- calibre login ----------------
 # Address, username and password live in cwa.conf beside the config. The daemon
 # re-reads that file before every login, refresh and upload, so a change here
@@ -1803,6 +1870,7 @@ settings_menu() {
         printf '   4) Recovery history\n'
         printf '   5) Restart UI now (clears stuck downloads)\n'
         printf '   6) Calibre login\n'
+        printf '   7) Remote access (dev): %s\n' "$(remote_text)"
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -1817,6 +1885,28 @@ settings_menu() {
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
             2) light_idle_next ;;
             6) calibre_login_menu ;;
+            7) clear 2>/dev/null; echo
+               if remote_running; then
+                   remote_stop; printf '   remote access stopped\n'
+               else
+                   printf '   Starts an FTP server on this Kindle for %s minutes.\n' "$REMOTE_MINUTES"
+                   printf '   It serves /mnt/us as root with NO password: anyone on\n'
+                   printf '   this network can read and write it while it is on.\n'
+                   printf '   For pulling logs and pushing test scripts.\n\n'
+                   printf '   type YES to start it > '
+                   read _ra 2>/dev/null
+                   if [ "$_ra" = "YES" ]; then
+                       if remote_start; then
+                           emit "remote access: ftp on $(device_ip):$REMOTE_PORT via $REMOTE_HOW, ${REMOTE_MINUTES}min"
+                           printf '\n   started (%s): ftp://%s:%s/\n' "$REMOTE_HOW" "$(device_ip)" "$REMOTE_PORT"
+                       else
+                           printf '\n   could not start: %s\n' "$REMOTE_HOW"
+                       fi
+                   else
+                       printf '\n   cancelled\n'
+                   fi
+               fi
+               echo; printf ' [enter] > '; read _x 2>/dev/null ;;
             3) clear 2>/dev/null
                tail -30 /mnt/us/kfx-daemon.log 2>/dev/null | sed 's/^/  /' || echo "  no log yet"
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
@@ -2284,6 +2374,7 @@ while :; do
     else
         _idle=$((_idle + UI_STEP))
         _since=$((_since + UI_STEP))
+        remote_expire
         _li=$(light_idle)
         [ "$_li" -gt 0 ] && [ "$_idle" -ge "$_li" ] && light_off
         if [ "$_since" -ge "$REFRESH" ]; then

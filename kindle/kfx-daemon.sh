@@ -314,6 +314,7 @@ loop() {
             DO_CLOUD=; DO_RESEND=; DO_PURGE=; DO_SWEEP=
             drop_lock
             maybe_recover_wedge
+        remote_expire        # stop dev FTP when its time is up, menu open or not
         else
             # The menu is driving. Stay out of its way rather than racing it.
             dlog "skipped: $(lock_holder) holds the run lock"

@@ -112,3 +112,17 @@ up. Retrying with jitter is the whole difference.
   trailer, and `printf` octal escapes for the headers; the Kindle's own `unzip`
   reads the result back byte-for-byte. Used to rebuild a book's archive when a
   piece arrives late.
+
+## What the Kindle can reach, and what it can host
+
+Measured 11 Sep 2026 on this device (curl 7.86.0, OpenSSL 1.0.2q, 2018):
+
+- **HTTPS to GitHub works, with certificate checking.** raw.githubusercontent.com,
+  github.com and api.github.com all return 200 with verify result 0, over TLS 1.2,
+  against a CA bundle of 145 certificates at `/etc/ssl/certs/ca-certificates.crt`.
+  So the device can pull its own updates; no server is needed for that direction.
+- **There is no SSH.** No `sshd`, no `dropbear`. Real SSH means installing
+  `usbnet`, which is not present.
+- **busybox does have `ftpd`,** plus `telnetd` and `nc`. `ftpd` expects a
+  super-server in front of it (`tcpsvd` or `inetd`), and serves as root with no
+  password -- which is why Settings offers it only for a fixed period.
