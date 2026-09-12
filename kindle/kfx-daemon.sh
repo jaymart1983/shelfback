@@ -34,10 +34,16 @@ EVERY_SWEEP=${EVERY_SWEEP:-4}          # walk local files      ~2m
 EVERY_PURGE=${EVERY_PURGE:-10}         # delete synced books   ~5m  (~14s each)
 EVERY_LIBRARY=${EVERY_LIBRARY:-20}     # report the catalogue  ~10m
 EVERY_STATS=${EVERY_STATS:-10}         # refresh the panel counts ~5m, even idle
-# Ask the update daemon to look for new code. Only an ask: it owns the download,
-# the verify and the restart, and it is the one process a bad update cannot
-# take down with it.
-EVERY_UPDATE=${EVERY_UPDATE:-240}      # ~2h at a 30s tick
+
+# The update daemon runs alongside this one and keeps its own schedule -- a
+# check on start and every quarter of an hour after. Nothing is asked of it
+# from here except when someone asks for a check by hand.
+UPDATER=${UPDATER:-$BASE/kfx-update.sh}
+start_updater() {
+    [ -x "$UPDATER" ] || return 0
+    sh "$UPDATER" start >/dev/null 2>&1 &
+    return 0
+}
 PASS_EVERY=$TICK                       # what the menu shows
 
 # The daemon is always up; whether it syncs on a timer is a separate flag the
@@ -337,7 +343,6 @@ loop() {
             maybe_recover_wedge
         remote_ensure        # put dev FTP back if the toggle is on -- the
                              # framework restart that clears a jam kills it
-        [ "$(every "$tick" "$EVERY_UPDATE")" = 1 ] && request_update
         else
             # The menu is driving. Stay out of its way rather than racing it.
             dlog "skipped: $(lock_holder) holds the run lock"
@@ -397,6 +402,9 @@ case "${1:-status}" in
         }
         ;;
     loop)
+        # Started with the sync daemon, not before or instead of it: if the
+        # updater will not run, books still sync.
+        start_updater
         echo $$ > "$PIDFILE"
         loop
         ;;

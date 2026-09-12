@@ -1819,15 +1819,32 @@ remote_text() {
 device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
 
 # ---------------- updates ----------------
-# The update daemon is a separate process (kfx-update.sh) because the thing
-# that restarts the sync daemon must not be the sync daemon. From here we only
-# ever ask: write a request and let it work, so a slow or failing download
-# cannot hang the menu.
+# The update daemon (kfx-update.sh) does the work: it checks on its own every
+# quarter of an hour and announces what it finds. The front end only reads its
+# state files and writes requests, so a slow or failing download can never hang
+# the menu.
 UPDATER=${UPDATER:-${BASE:-/mnt/us/extensions/kfx-sync}/kfx-update.sh}
 UPDATE_REQ=${UPDATE_REQ:-/var/local/kfx-update.req}
+UPDATE_AVAIL=${UPDATE_AVAIL:-${STATEDIR:-/var/local/kfx-state}/UPDATE_AVAIL}
+UPDATE_DUE=${UPDATE_DUE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_DUE}
+UPDATE_GO=${UPDATE_GO:-${STATEDIR:-/var/local/kfx-state}/UPDATE_GO}
+UPDATE_STATE=${UPDATE_STATE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_STATE}
 ULOG=${ULOG:-/mnt/us/kfx-update.log}
 
 installed_version() { cat "${BASE:-/mnt/us/extensions/kfx-sync}/VERSION" 2>/dev/null; }
+update_available()  { cat "$UPDATE_AVAIL" 2>/dev/null; }
+update_status()     { cat "$UPDATE_STATE" 2>/dev/null; }
+
+# "in 4m", or "now" once the deadline has passed.
+update_due_text() {
+    _ud_t=$(cat "$UPDATE_DUE" 2>/dev/null)
+    case "$_ud_t" in ''|*[!0-9]*) printf 'soon'; return ;; esac
+    _ud_s=$(( _ud_t - $(date +%s) ))
+    if   [ "$_ud_s" -le 0 ];  then printf 'now'
+    elif [ "$_ud_s" -lt 60 ]; then printf 'in %ss' "$_ud_s"
+    else printf 'in %sm' "$(( (_ud_s + 59) / 60 ))"
+    fi
+}
 
 request_update() {
     [ -f "$UPDATER" ] || return 1
@@ -1835,36 +1852,82 @@ request_update() {
     : > "$UPDATE_REQ" 2>/dev/null || return 1
     return 0
 }
+request_install() {
+    [ -f "$UPDATER" ] || return 1
+    mkdir -p "$(dirname "$UPDATE_GO")" 2>/dev/null
+    : > "$UPDATE_GO" 2>/dev/null || return 1
+    return 0
+}
 
-# Waits, because the point of the menu item is to see what happened. The
-# updater logs every step, so this watches its log rather than guessing.
-check_updates_menu() {
+# Every line clipped to the screen. The updater writes sentences, and one line
+# wrapping pushes the rest of the page down and makes the whole screen look
+# broken.
+uline() { printf '   %s\n' "$(short "$1" $((W - 4)))"; }
+
+updates_screen() {
     clear 2>/dev/null
-    rule; printf ' check for updates\n'; rule; echo
+    rule; printf ' updates\n'; rule; echo
     if [ ! -f "$UPDATER" ]; then
-        printf '   the updater is not installed:\n   %s\n' "$UPDATER"
+        uline "The updater is not installed."
+        uline "$UPDATER"
         echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
     fi
-    printf '   installed: %s\n' "$(stat_or "$(installed_version)")"
-    _cu_mark=$(wc -l < "$ULOG" 2>/dev/null | tr -d ' ')
-    case "$_cu_mark" in ''|*[!0-9]*) _cu_mark=0 ;; esac
-    if request_update; then
-        printf '   asked the updater to check...\n\n'
-    else
-        printf '   could not reach the updater -- is it running?\n'
+    uline "Installed: $(stat_or "$(installed_version)")"
+    _us_a=$(update_available)
+    [ -n "$_us_a" ] && uline "Available: $_us_a"
+    echo
+    uline "Checking for Updates"
+    echo
+    if ! request_update; then
+        uline "The updater is not running."
         echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
     fi
-    # Up to a minute: a check is two small downloads, an install is eight.
-    _cu_n=0
-    while [ "$_cu_n" -lt 60 ]; do
-        sleep 2; _cu_n=$((_cu_n + 2))
-        [ -f "$UPDATE_REQ" ] && continue      # not picked up yet
-        _cu_now=$(wc -l < "$ULOG" 2>/dev/null | tr -d ' ')
-        case "$_cu_now" in ''|*[!0-9]*) _cu_now=0 ;; esac
-        [ "$_cu_now" -gt "$_cu_mark" ] && break
+    # The daemon deletes the request when it picks it up, and writes one line
+    # of state when it has an answer. Wait for that, not for a log to grow.
+    _us_was=$(update_status)
+    _us_n=0
+    while [ "$_us_n" -lt 45 ]; do
+        sleep 2; _us_n=$((_us_n + 2))
+        [ -f "$UPDATE_REQ" ] && continue
+        [ "$(update_status)" != "$_us_was" ] && break
+        [ "$_us_n" -ge 12 ] && break        # answered the same as before
     done
-    tail -8 "$ULOG" 2>/dev/null | sed 's/^/   /'
-    printf '\n   installed now: %s\n' "$(stat_or "$(installed_version)")"
+    uline "$(stat_or "$(update_status)")"
+    _us_a=$(update_available)
+    if [ -n "$_us_a" ]; then
+        echo
+        uline "Version $_us_a will install $(update_due_text)."
+        uline "Choose Install Update on the main menu to do it now."
+    fi
+    echo; printf ' [enter] > '; read _x 2>/dev/null
+}
+
+install_update_screen() {
+    clear 2>/dev/null
+    rule; printf ' updates\n'; rule; echo
+    _iu_a=$(update_available)
+    if [ -z "$_iu_a" ]; then
+        uline "Nothing to install."
+        echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
+    fi
+    uline "Installing $_iu_a"
+    uline "This restarts the background sync. It takes about a minute."
+    echo
+    if ! request_install; then
+        uline "The updater is not running."
+        echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
+    fi
+    _iu_n=0
+    while [ "$_iu_n" -lt 120 ]; do
+        sleep 3; _iu_n=$((_iu_n + 3))
+        [ -n "$(update_available)" ] || break     # cleared: done, either way
+    done
+    uline "$(stat_or "$(update_status)")"
+    uline "Installed: $(stat_or "$(installed_version)")"
+    if [ "$(installed_version)" != "$KFX_BUILD" ]; then
+        echo
+        uline "Close and reopen KFX Sync to run the new version."
+    fi
     echo; printf ' [enter] > '; read _x 2>/dev/null
 }
 
@@ -2080,8 +2143,11 @@ draw() {
     fi
     printf ' 3) Books\n'
     [ "$(state_get N_PROBLEMS)" -gt 0 ] 2>/dev/null && printf ' 4) View problems\n'
+    _mm_up=$(update_available)
+    [ -n "$_mm_up" ] && printf ' 5) Install update %s (otherwise %s)\n' \
+        "$_mm_up" "$(update_due_text)"
     echo
-    printf ' U) Check for updates\n'
+    printf ' U) Updates\n'
     printf ' S) Settings\n'
     printf ' R) Refresh\n'
     printf ' L) Log\n'
@@ -2498,7 +2564,8 @@ while :; do
             2) monitor_toggle ;;
             3) books_menu ;;
             4) refresh_state full; list_problems ;;
-            u|U) check_updates_menu ;;
+            5) [ -n "$(update_available)" ] && install_update_screen ;;
+            u|U) updates_screen ;;
             s|S) settings_menu ;;
             r|R) refresh_state full ;;
             l|L) view_log ;;

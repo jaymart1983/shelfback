@@ -27,8 +27,8 @@ CONF=${CONF:-$BASE/config}
 # Where updates come from. A branch, not a tag: publishing an update is
 # committing a new VERSION, and rolling one back is committing the old one.
 UPDATE_URL=${UPDATE_URL:-https://raw.githubusercontent.com/jaymart1983/shelfback/main/kindle}
-UPDATE_EVERY=${UPDATE_EVERY:-21600}      # a check every six hours
-UPDATE_POLL=${UPDATE_POLL:-30}           # how often to look for a request
+UPDATE_EVERY=${UPDATE_EVERY:-900}        # a check every fifteen minutes
+UPDATE_POLL=${UPDATE_POLL:-10}           # how often to look for a request
 UPDATE_REQ=${UPDATE_REQ:-/var/local/kfx-update.req}
 UPDATE_PID=${UPDATE_PID:-/var/local/kfx-update.pid}
 ULOG=${ULOG:-/mnt/us/kfx-update.log}
@@ -161,38 +161,89 @@ restart_sync() {
     sync_running
 }
 
-# ---------------- one cycle ----------------
+# ---------------- finding, then installing ----------------
+# Finding an update and installing it are separate, because an install restarts
+# the sync daemon and replaces the front end under whoever is reading it. So a
+# new version is ANNOUNCED first: the menu grows an "Install update" item, and
+# if nobody chooses it the install happens on its own after UPDATE_DELAY. The
+# device ends up current either way; the difference is whether it happens while
+# someone is looking at it.
+UPDATE_DELAY=${UPDATE_DELAY:-300}                 # five minutes to decide
+UPDATE_AVAIL=${UPDATE_AVAIL:-${STATEDIR:-/var/local/kfx-state}/UPDATE_AVAIL}
+UPDATE_DUE=${UPDATE_DUE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_DUE}
+UPDATE_GO=${UPDATE_GO:-${STATEDIR:-/var/local/kfx-state}/UPDATE_GO}
+UPDATE_SEEN=${UPDATE_SEEN:-${STATEDIR:-/var/local/kfx-state}/UPDATE_SEEN}
+UPDATE_STATE=${UPDATE_STATE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_STATE}
+
+# One line the menu can show without reading a log: what happened last.
+set_state() { mkdir -p "$(dirname "$UPDATE_STATE")" 2>/dev/null
+              printf '%s\n' "$1" > "$UPDATE_STATE" 2>/dev/null; }
+
+announce() {   # $1 = the version found
+    mkdir -p "$(dirname "$UPDATE_AVAIL")" 2>/dev/null
+    printf '%s\n' "$1" > "$UPDATE_AVAIL"
+    [ -f "$UPDATE_DUE" ] || printf '%s\n' "$(( $(date +%s) + UPDATE_DELAY ))" > "$UPDATE_DUE"
+    set_state "update $1 available"
+}
+forget_update() { rm -f "$UPDATE_AVAIL" "$UPDATE_DUE" "$UPDATE_GO" 2>/dev/null; }
+
+# Look, and say what was found. Does not install.
+#
+# Logs only when the answer CHANGES. Checking every fifteen minutes and writing
+# "up to date" each time buries the one line that matters under ninety-six that
+# do not.
 check_once() {
     _co_have=$(local_version); _co_want=$(remote_version)
     if [ -z "$_co_want" ]; then
-        say "could not reach $UPDATE_URL"; return 1
+        set_state "could not reach the update source"
+        [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "unreachable" ] || ulog "could not reach $UPDATE_URL"
+        printf 'unreachable\n' > "$UPDATE_SEEN" 2>/dev/null
+        return 1
     fi
     # A version is a build stamp: digits and a dot. Anything else means the
     # file is not what we think it is.
     case "$_co_want" in
-        *[!0-9.]*|'') say "refusing a version that is not a build stamp: $_co_want"; return 1 ;;
+        *[!0-9.]*|'') say "refusing a version that is not a build stamp: $_co_want"
+                      set_state "the published version is not a build stamp"; return 1 ;;
     esac
     if [ "$_co_want" = "$_co_have" ]; then
-        ulog "up to date ($_co_have)"
-        UPDATE_LAST="up to date"
+        forget_update
+        set_state "up to date"
+        [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "$_co_want" ] || ulog "up to date ($_co_have)"
+        printf '%s\n' "$_co_want" > "$UPDATE_SEEN" 2>/dev/null
         return 0
     fi
-    say "update: $_co_have -> $_co_want"
-    fetch_all    || { UPDATE_LAST="download failed"; rm -rf "$STAGE"; return 1; }
-    verify_stage || { UPDATE_LAST="the download did not verify"; rm -rf "$STAGE"; return 1; }
-    install_stage "$_co_want" || {
-        UPDATE_LAST="install failed"; roll_back; rm -rf "$STAGE"; return 1
+    [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "$_co_want" ] || say "update available: $_co_have -> $_co_want"
+    printf '%s\n' "$_co_want" > "$UPDATE_SEEN" 2>/dev/null
+    announce "$_co_want"
+    return 0
+}
+
+# Do it. Called when the deadline passes, or when someone chooses to now.
+install_now() {
+    _in_want=$(cat "$UPDATE_AVAIL" 2>/dev/null)
+    [ -n "$_in_want" ] || return 1
+    case "$_in_want" in *[!0-9.]*) forget_update; return 1 ;; esac
+    say "installing $(local_version) -> $_in_want"
+    set_state "installing $_in_want"
+    fetch_all    || { set_state "download failed"; say "download failed"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
+    verify_stage || { set_state "the download did not verify"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
+    install_stage "$_in_want" || {
+        set_state "install failed, rolled back"; roll_back; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1
     }
     rm -rf "$STAGE"
     if restart_sync; then
-        say "installed $_co_want and restarted the sync daemon"
-        UPDATE_LAST="installed $_co_want"
+        say "installed $_in_want and restarted the sync daemon"
+        set_state "installed $_in_want"
+        forget_update
+        printf '%s\n' "$_in_want" > "$UPDATE_SEEN" 2>/dev/null
     else
-        say "the sync daemon will not start on $_co_want -- rolling back"
+        say "the sync daemon will not start on $_in_want -- rolling back"
         roll_back
         if restart_sync; then say "back on $(local_version)"
         else say "ROLLBACK DID NOT START EITHER -- needs a USB cable"; fi
-        UPDATE_LAST="rolled back"
+        set_state "rolled back: $_in_want would not run"
+        forget_update
         return 1
     fi
     # This process is still running the old updater, and the file on disk is
@@ -203,6 +254,17 @@ check_once() {
         ulog "re-exec on the new updater"
         UPDATE_REEXEC=0 exec sh "$BASE/kfx-update.sh" loop
     fi
+    return 0
+}
+
+# check, then install if one is waiting and its time has come
+check_and_maybe_install() {
+    check_once || return 1
+    [ -f "$UPDATE_AVAIL" ] || return 0
+    if [ -f "$UPDATE_GO" ]; then rm -f "$UPDATE_GO"; install_now; return $?; fi
+    _cm_due=$(cat "$UPDATE_DUE" 2>/dev/null)
+    case "$_cm_due" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$(date +%s)" -ge "$_cm_due" ] && { install_now; return $?; }
     return 0
 }
 
@@ -221,25 +283,48 @@ loop() {
     IN_LOOP=1
     echo $$ > "$UPDATE_PID"
     trap 'rm -f "$UPDATE_PID"; exit 0' INT TERM HUP
-    ulog "update daemon started, installed version $(local_version)"
-    _lp_last=0
+    ulog "update daemon started on $(local_version)"
+    # Check immediately. The device may have been off for a week, and waiting a
+    # quarter of an hour to find that out helps nobody.
+    check_and_maybe_install
+    _lp_last=$(date +%s)
     while :; do
-        # Asked for, by the menu or over FTP: check straight away.
-        if [ -f "$UPDATE_REQ" ]; then
-            rm -f "$UPDATE_REQ"
-            ulog "check requested"
-            check_once
-            _lp_last=$(date +%s)
-        elif [ $(( $(date +%s) - _lp_last )) -ge "$UPDATE_EVERY" ]; then
-            check_once
-            _lp_last=$(date +%s)
-        fi
         sleep "$UPDATE_POLL"
+        if [ -f "$UPDATE_REQ" ]; then
+            # Asked for from the menu or over FTP. Not logged: the answer gets
+            # logged if it changed, and "someone pressed a key" is not news.
+            rm -f "$UPDATE_REQ"
+            check_and_maybe_install
+            _lp_last=$(date +%s)
+            continue
+        fi
+        # Chosen from the menu: install the announced version now, without
+        # waiting out the rest of the five minutes.
+        if [ -f "$UPDATE_GO" ]; then
+            rm -f "$UPDATE_GO"
+            install_now
+            _lp_last=$(date +%s)
+            continue
+        fi
+        # The deadline on an announced update.
+        if [ -f "$UPDATE_AVAIL" ]; then
+            _lp_due=$(cat "$UPDATE_DUE" 2>/dev/null)
+            case "$_lp_due" in
+                ''|*[!0-9]*) : ;;
+                *) [ "$(date +%s)" -ge "$_lp_due" ] && { install_now; _lp_last=$(date +%s); continue; } ;;
+            esac
+        fi
+        [ $(( $(date +%s) - _lp_last )) -ge "$UPDATE_EVERY" ] && {
+            check_and_maybe_install
+            _lp_last=$(date +%s)
+        }
     done
 }
 
 case "${1:-status}" in
-    check)   check_once ;;
+    check)   check_and_maybe_install ;;
+    install) : > "$UPDATE_GO"
+             if [ -n "$(update_pids)" ]; then echo "installing"; else install_now; fi ;;
     request) mkdir -p "$(dirname "$UPDATE_REQ")" 2>/dev/null
              : > "$UPDATE_REQ"
              if [ -n "$(update_pids)" ]; then echo "asked the update daemon to check"
@@ -255,9 +340,10 @@ case "${1:-status}" in
              rm -f "$UPDATE_PID"
              [ "$_n" -gt 0 ] && echo "stopped" || echo "not running" ;;
     status)  _v=$(local_version); printf 'installed: %s\n' "${_v:-unknown}"
+             _a=$(cat "$UPDATE_AVAIL" 2>/dev/null); [ -n "$_a" ] && printf 'available: %s\n' "$_a"
              if [ -n "$(update_pids)" ]; then echo "update daemon: running"
              else echo "update daemon: not running"; fi
              [ -f "$ULOG" ] && tail -5 "$ULOG" ;;
     loop)    loop ;;
-    *)       echo "usage: $0 {check|request|start|stop|status|loop}"; exit 1 ;;
+    *)       echo "usage: $0 {check|install|request|start|stop|status|loop}"; exit 1 ;;
 esac
