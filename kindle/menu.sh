@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09112026.2147   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09112026.2153   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -2026,8 +2026,11 @@ m_since() {
 # sync already keeps -- one sqlite3 query for every title, not one per book --
 # because a per-book lookup is several seconds on this CPU.
 #
-#   pieces   "3/4" (present/needed) while the book is on this Kindle, from
-#            cwa.parts, which cwa_complete writes each time it opens a book;
+#   pieces   "3/4" (present/needed) while the book is on this Kindle, from the
+#            book's record, which cwa_complete updates each time it opens one.
+#            Nothing decides anything from these numbers -- completeness is
+#            recomputed from the archive itself -- but this screen cannot unzip
+#            every book just to draw a column;
 #            "?" until it has; "Cleared" once the book is sent and gone from
 #            here -- it needs no tracking after that; "-" before it arrives.
 #   status   in the order the list is sorted, work still to do first:
@@ -2063,25 +2066,32 @@ all_books_table() {   # $1 = output file: "title<TAB>pieces<TAB>status<TAB>key"
     done > "$_ab_t.local"
     { [ -s "$SYNCED_CACHE" ] && [ "$BACKEND" != cwa ] && cat "$SYNCED_CACHE"; } > "$_ab_t.done"
     LC_ALL=C awk -F'\t' -v now="$(date +%s)" -v grace="${CWA_GRACE:-1800}" -v cwa="$BACKEND" \
-        -v asins="$_ab_st/cwa.asins" -v ups="$_ab_st/cwa.uploads" -v held="$_ab_st/cwa.held" \
-        -v parts="$_ab_st/cwa.parts" -v seed="${CWA_SEED:-/nonexistent}" -v done="$_ab_t.done" \
+        -v asins="$_ab_st/cwa.asins" -v state="$STATE_FILE" \
+        -v seed="${CWA_SEED:-/nonexistent}" -v done="$_ab_t.done" \
         -v infl="$INFLIGHT" -v stuck="$STUCKLIST" -v local_="$_ab_t.local" '
         function rd(f, arr,   l, a) { while ((getline l < f) > 0) { split(l, a, " "); arr[a[1]] = l } }
         # A title taken from a file name: no extension, no trailing _<ASIN> or _<UUID>.
         function nice(n) { sub(/\.(kfx(-zip)?|azw3?|mobi|pdf)$/, "", n); sub(/_B[A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9](_sample)?$/, "", n)
                            sub(/_[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]+$/, "", n); return n }
         BEGIN {
-            rd(asins, A); rd(held, H); rd(parts, P); rd(infl, I); rd(stuck, S)
+            rd(asins, A); rd(infl, I); rd(stuck, S)
             while ((getline l < done) > 0) D[l] = 1          # whole line: keys can hold spaces
             while ((getline l < seed) > 0) if (l !~ /^#/ && l != "") SD[l] = 1
-            while ((getline l < ups) > 0) { split(l, u, "\t"); U[u[1]] = u[2]; if (!(u[1] in T)) T[u[1]] = nice(u[3]) }
+            # One pass over the book records: stage, when it entered it, and
+            # the pieces. Everything this screen used to read from four files.
+            while ((getline l < state) > 0) {
+                if (l ~ /^#/) continue
+                if (split(l, u, "\t") < 9) continue
+                SG[u[1]] = u[2]; SN[u[1]] = u[3]; NE[u[1]] = u[6]; HA[u[1]] = u[7]
+                if (!(u[1] in T) && u[9] != "-" && u[9] != "") T[u[1]] = nice(u[9])
+            }
             while ((getline l < local_) > 0) { split(l, u, "\t"); L[u[1]] = 1; if (u[3] == "kfx" || u[3] == "azw3") LK[u[1]] = 1; if (u[3] == "azw3") AZ[u[1]] = 1
                                                if (!(u[1] in T)) T[u[1]] = nice(u[2]) }
         }
         { if ($1 != "") { if ($2 != "") T[$1] = $2; K[$1] = 1 } }
         END {
             for (k in L) K[k] = 1
-            for (k in U) K[k] = 1
+            for (k in SG) K[k] = 1        # books we have a record of, wherever they are now
             for (k in K) {
                 a = k; sub(/_sample$/, "", a)
                 here = (k in L)
@@ -2089,9 +2099,10 @@ all_books_table() {   # $1 = output file: "title<TAB>pieces<TAB>status<TAB>key"
                 # old receiver; any other ASIN-less upload can only ever be "Sent".
                 if (cwa == "cwa") ok = (a in A) || (k in SD)
                 else ok = (k in D) || (a in D)
-                if (ok)                                   { st = "Sent Success"; r = 7 }
-                else if (a in H)                          { st = "Waiting Part"; r = 4 }
-                else if ((k in U) && (now - U[k] < grace || k !~ /^B[A-Z0-9]/)) { st = "Sent"; r = 6 }
+                if (ok || SG[k] == "confirmed")           { st = "Sent Success"; r = 7 }
+                else if (SG[a] == "waiting")              { st = "Waiting Part"; r = 4 }
+                else if (SG[k] == "uploaded" && (now - SN[k] < grace || k !~ /^B[A-Z0-9]/)) { st = "Sent"; r = 6 }
+                else if (SG[k] == "failed")               { st = "Failed"; r = 4 }
                 else if (a in I)                          { st = "Downloading"; r = 2 }
                 else if (a in S)                          { st = "Stuck"; r = 3 }
                 else if (here && (k in LK))               { st = "Not Sent"; r = 5 }
@@ -2100,7 +2111,7 @@ all_books_table() {   # $1 = output file: "title<TAB>pieces<TAB>status<TAB>key"
                 if (!here)       pc = (r >= 6 ? "Cleared" : "-")
                 else if (!(k in LK)) pc = "-"
                 else if (k in AZ)    pc = "1/1"      # one file, nothing to gather
-                else if (a in P) { split(P[a], p, " "); pc = p[3] "/" p[2] }
+                else if (a in NE && NE[a] + 0 > 0) pc = HA[a] "/" NE[a]
                 else             pc = "?"
                 t = (k in T && T[k] != "" ? T[k] : k)
                 printf "%d\t%s\t%s\t%s\t%s\n", r, t, pc, st, k

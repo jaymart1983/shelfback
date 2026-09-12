@@ -66,7 +66,6 @@ CWA_MAP="$CWA_STATE/cwa.map"        # "<book id> <ASIN>", or "<book id> - <epoch
 # genuinely have none; re-reading those every 10 minutes costs a few requests.
 CWA_RECHECK=${CWA_RECHECK:-600}
 CWA_ASINS="$CWA_STATE/cwa.asins"    # ASINs Calibre holds, one per line, sorted
-CWA_UPLOADS="$CWA_STATE/cwa.uploads" # "<key>\t<epoch>\t<file name>" -- tabs: keys can hold spaces
 # How long an upload counts as done before Calibre has to confirm it. Covers
 # CWA's import and conversion plus backfill-asins' 10-minute cycle, which is
 # what records the ASIN the book page shows.
