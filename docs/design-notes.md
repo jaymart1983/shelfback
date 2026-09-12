@@ -150,6 +150,30 @@ after installing, because the file on disk is new while the running process is
 old. Done unconditionally, `kfx-update.sh check` typed at a prompt turns into a
 background daemon and never returns. It re-execs only when it is the daemon.
 
+## A CDN publishes the files and the version marker separately
+
+Measured 12 Sep 2026, minutes after a push: `menu.sh` on
+raw.githubusercontent.com was already the new build while `VERSION` still
+served the old one. A cache-busting query string did not help; they are
+separate objects with separate lifetimes.
+
+Either order is possible, and one of them is dangerous: a fresh `VERSION` with
+stale files means installing old code under a new number. The first version of
+the updater made that invisible, because it stamped the incoming `menu.sh` with
+whatever `VERSION` said -- so the mislabelling was automatic.
+
+So the code carries its own version, and the two must agree: `menu.sh`'s
+`KFX_BUILD` must already equal the `VERSION` being installed, or the release is
+half-published and the device waits for the next check. `publish.sh` stamps both
+together so they cannot drift apart in the repository.
+
+## The Kindle leaves the network when it sleeps
+
+The device does not answer ping at all while suspended -- not a refused
+connection, no response. So the dev FTP server only answers while the Kindle is
+awake, and "the server is down" and "the Kindle is asleep" look identical from
+a laptop. Wake it before reaching for the log.
+
 ## What the Kindle can reach, and what it can host
 
 Measured 11 Sep 2026 on this device (curl 7.86.0, OpenSSL 1.0.2q, 2018):

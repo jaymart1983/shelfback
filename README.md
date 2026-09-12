@@ -148,7 +148,9 @@ again.
   root with **no password**, so it is off by default and has to be confirmed --
   but once on it stays on until you turn it off, because waiting for the next
   jam can take hours. The daemon puts it back after the framework restart that
-  clears a jam.
+  clears a jam. The panel shows it, and says **FTP IN USE** while anyone is
+  connected. Note the Kindle leaves the network when it sleeps, so it only
+  answers while awake.
 
 ### When something is wrong
 
@@ -166,8 +168,9 @@ again.
 The device can update itself from this repository, so a fix does not need a
 cable:
 
-- `kindle/VERSION` is the release. **Committing a new VERSION publishes an
-  update**; committing the old one rolls it back.
+- `kindle/VERSION` is the release, and `menu.sh`'s `KFX_BUILD` must match it.
+  `kindle/publish.sh` stamps both and can commit them; **publishing an update
+  is committing a new VERSION**, and rolling one back is committing the old one.
 - `kindle/MANIFEST` lists the files a release is made of.
 - `kfx-update.sh` is a second daemon, separate from the sync daemon because the
   thing that restarts the sync daemon cannot be the sync daemon. It compares
@@ -176,8 +179,11 @@ cable:
 
 It does not trust the download. Every `.sh` must parse; a file starting with
 `<` is a web page, not a script; a version that is not a build stamp is
-refused; and a manifest name containing a slash or a leading dot is refused
-before it becomes a path. The previous release is kept, and **if the sync
+refused; a manifest name containing a slash or a leading dot is refused before
+it becomes a path; and the downloaded `menu.sh` must already carry the version
+being installed, because a CDN refreshes the files and the version marker
+independently and a half-published release would otherwise install stale code
+under a new number. The previous release is kept, and **if the sync
 daemon will not start on the new code, the old code goes back** and the daemon
 is restarted on it. A failed update has to leave a working Kindle, because the
 alternative is finding a USB cable.

@@ -104,6 +104,23 @@ verify_stage() {
     [ "$_vs_bad" = 0 ]
 }
 
+# The files and the version marker are separate objects on a CDN and refresh
+# independently. Measured 12 Sep 2026: minutes after a push, menu.sh served the
+# new build while VERSION still served the old one. The other order is the
+# dangerous one -- new VERSION, stale files -- and an earlier version of this
+# script made it invisible by stamping the incoming menu.sh with whatever
+# VERSION said, which labels old code as new.
+#
+# So the code carries its own version, and it has to agree. A mismatch is a
+# half-propagated release: leave it, say so once, and pick it up next time.
+stage_matches() {   # $1 = the version we believe we are installing
+    [ -f "$STAGE/menu.sh" ] || return 0
+    _sm_b=$(sed -n 's/^KFX_BUILD=\([0-9.]*\).*/\1/p' "$STAGE/menu.sh" | head -1)
+    [ "$_sm_b" = "$1" ] && return 0
+    say "half-published: VERSION says $1 but menu.sh is $_sm_b -- waiting"
+    return 1
+}
+
 # ---------------- install ----------------
 install_stage() {   # $1 = the version being installed
     rm -rf "$BACKUP"; mkdir -p "$BACKUP" 2>/dev/null
@@ -113,20 +130,6 @@ install_stage() {   # $1 = the version being installed
     done < "$STAGE/MANIFEST"
     cp "$BASE/VERSION" "$BACKUP/VERSION" 2>/dev/null
     cp "$STAGE/MANIFEST" "$BACKUP/MANIFEST" 2>/dev/null
-
-    # The build number on screen must mean "the code that is running", so the
-    # incoming menu.sh is stamped with the version being installed. Without
-    # this it would keep whatever the last USB deploy stamped, and every
-    # over-the-air update would look like the build before it.
-    if [ -f "$STAGE/menu.sh" ]; then
-        sed "s/^KFX_BUILD=.*/KFX_BUILD=$1   # installed over the air/" \
-            "$STAGE/menu.sh" > "$STAGE/menu.sh.stamped" 2>/dev/null
-        if sh -n "$STAGE/menu.sh.stamped" 2>/dev/null; then
-            mv "$STAGE/menu.sh.stamped" "$STAGE/menu.sh"
-        else
-            rm -f "$STAGE/menu.sh.stamped"; say "stamping menu.sh broke it"; return 1
-        fi
-    fi
 
     while read -r _is_f; do
         case "$_is_f" in ''|'#'*) continue ;; esac
@@ -228,6 +231,14 @@ install_now() {
     set_state "installing $_in_want"
     fetch_all    || { set_state "download failed"; say "download failed"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
     verify_stage || { set_state "the download did not verify"; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1; }
+    stage_matches "$_in_want" || {
+        set_state "waiting: the release is still publishing"
+        rm -rf "$STAGE"; rm -f "$UPDATE_GO"
+        # Not a failure of ours, and not permanent: drop the announcement so
+        # the next check re-reads both and announces again when they agree.
+        forget_update
+        return 1
+    }
     install_stage "$_in_want" || {
         set_state "install failed, rolled back"; roll_back; rm -rf "$STAGE"; rm -f "$UPDATE_GO"; return 1
     }
