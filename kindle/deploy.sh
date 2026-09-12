@@ -12,7 +12,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 KINDLE=${KINDLE:-/Volumes/Kindle}
 EXT="$KINDLE/extensions/kfx-sync"
 DOCS="$KINDLE/documents"
-FILES="menu.sh cwa.sh kfx-daemon.sh launch.sh kual-status.sh"
+FILES="menu.sh cwa.sh state.sh kfx-daemon.sh launch.sh kual-status.sh"
 # menu.json is what KUAL reads, if KUAL is installed; it is inert otherwise.
 DATA="menu.json"
 # The way in without KUAL: a scriptlet in documents/, whose "# Name:" header

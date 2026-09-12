@@ -212,17 +212,19 @@ cwa_has() {   # $1 = ASIN
 # ---------------- what each book is made of ----------------
 # Written by cwa_complete each time it looks inside a book, read by the Books
 # list. Books sent before this existed have no line: their pieces are unknown.
-CWA_PARTS="$CWA_STATE/cwa.parts"    # "<ASIN> <pieces needed> <pieces present>"
+# Pieces are two fields on the book's record -- see state.sh. There is one
+# account of a book, and how many of its pieces are in hand is part of it.
 cwa_record_parts() {   # $1 = ASIN, $2 = needed, $3 = present
-    mkdir -p "$CWA_STATE" 2>/dev/null
-    sed -i "/^$1 /d" "$CWA_PARTS" 2>/dev/null
-    printf '%s %s %s\n' "$1" "$2" "$3" >> "$CWA_PARTS"
+    st_set "$1" "need=$2" "have=$3"
 }
 
 # ---------------- the upload record ----------------
 cwa_record_upload() {   # $1 = key, $2 = file name
-    mkdir -p "$CWA_STATE" 2>/dev/null
-    printf '%s\t%s\t%s\n' "$1" "$(date +%s)" "$2" >> "$CWA_UPLOADS"
+    # "uploaded, at this moment" -- the record's own stage and timestamp. The
+    # grace window below measures from it, and "tries" counts the sends, which
+    # is what caps a book Calibre never confirms.
+    st_set "$1" stage=uploaded note=-
+    st_bump "$1" tries
 }
 
 # Keys to treat as done without Calibre's say-so: an ASIN for CWA_GRACE after
@@ -234,10 +236,18 @@ cwa_record_upload() {   # $1 = key, $2 = file name
 CWA_SEED="$(dirname "$CWA_CONF")/cwa.seed"
 cwa_uploaded_keys() {
     [ -s "$CWA_SEED" ] && grep -v '^#' "$CWA_SEED" | grep -v '^$'
-    [ -s "$CWA_UPLOADS" ] || return 0
+    [ -s "$STATE_FILE" ] || return 0
+    # An ASIN counts as done for CWA_GRACE after its upload, by which time
+    # Calibre should have imported it and backfill-asins recorded the
+    # identifier. A key with no ASIN counts as done for good: Calibre has no
+    # way to confirm one, so the window would only expire and send it twice.
+    # "confirmed" is Calibre's own answer and never expires.
     awk -F'\t' -v now="$(date +%s)" -v grace="$CWA_GRACE" '
-        $1 ~ /^B[A-Z0-9]+(_sample)?$/ { if (now - $2 < grace) print $1; next }
-        { print $1 }' "$CWA_UPLOADS" | sort -u
+        /^#/ || NF < 9 { next }
+        $2 == "confirmed" { print $1; next }
+        $2 != "uploaded"  { next }
+        $1 ~ /^B[A-Z0-9]+(_sample)?$/ { if (now - $3 < grace) print $1; next }
+        { print $1 }' "$STATE_FILE" 2>/dev/null | sort -u
 }
 
 # The "done" list the rest of the Kindle works from, in the receiver's format:
@@ -252,16 +262,18 @@ cwa_synced_view() {   # $1 = output file
 # A book waiting on a piece that has not downloaded yet is not a bad copy, so
 # reconcile_local leaves it alone for CWA_GRACE -- the same window an upload
 # gets -- before giving up on it and starting over with a fresh download.
-CWA_HELD="$CWA_STATE/cwa.held"      # "<ASIN> <epoch first held>"
-cwa_hold() {   # $1 = ASIN; keeps the FIRST time, so the window cannot slide
-    mkdir -p "$CWA_STATE" 2>/dev/null
-    grep -q "^$1 " "$CWA_HELD" 2>/dev/null || printf '%s %s\n' "$1" "$(date +%s)" >> "$CWA_HELD"
+# Being held is a stage the book is in, and "since" is when it entered it.
+# st_set only restamps "since" when the stage actually changes, so re-holding a
+# book each pass cannot slide its window forward -- which is what the separate
+# file had to keep the first timestamp by hand to avoid.
+cwa_hold() { st_set "$1" stage=waiting; }
+cwa_unhold() {
+    [ "$(st_stage "$1" 2>/dev/null)" = waiting ] || return 0
+    st_set "$1" stage=queued
 }
-cwa_unhold() { sed -i "/^$1 /d" "$CWA_HELD" 2>/dev/null; }
 cwa_held_recent() {   # $1 = ASIN
-    _ch_t=$(sed -n "s/^$1 //p" "$CWA_HELD" 2>/dev/null | head -1)
-    [ -n "$_ch_t" ] || return 1
-    if [ $(( $(date +%s) - _ch_t )) -lt "$CWA_GRACE" ]; then return 0; fi
+    [ "$(st_stage "$1" 2>/dev/null)" = waiting ] || return 1
+    st_older_than "$1" "$CWA_GRACE" || return 0
     cwa_unhold "$1"    # window over: let the fresh download happen, once
     return 1
 }

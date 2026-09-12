@@ -7,9 +7,9 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09112026.2111   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09112026.2147   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
-CONF=/mnt/us/extensions/kfx-sync/config
+CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
 
 # Who this Kindle hands books to. "receiver" is the book-receiver service;
@@ -50,15 +50,22 @@ case "$_cols" in ''|*[!0-9]*) _cols=0 ;; esac
 W=${WIDTH:-$_cols}
 TAGW=${TAGW:-16}                # widest tag is "sent to receiver"
 
-# Only FAILED stays local: it counts attempts on THIS device, which is not
-# something the server can know or would want to arbitrate.
-FAILED="$OUT/.failed"
 # Matching is keyed on the ASIN, not the filename. The Kindle's FAT mount cannot
 # represent characters like an en-dash and substitutes "?", so a title read off
 # disk never byte-matches the name recorded at upload time and the book looks
 # perpetually pending. The ASIN is ASCII and survives that intact.
 LOG="$OUT/sync.log"; SPOOL=/tmp/kfxsync.spool
-mkdir -p "$OUT"; touch "$FAILED" "$LOG"; rm -f "$SPOOL"
+mkdir -p "$OUT"; touch "$LOG"; rm -f "$SPOOL"
+
+# The one record per book. It lives next to sync.log rather than in
+# /var/local so it can be read by mounting the Kindle, which is how this thing
+# gets debugged. Nothing syncs while the Kindle is mounted anyway, so losing
+# write access to it for the duration costs nothing.
+# Sourcing a missing file exits this shell outright, so test first.
+# Anchored on $CONF, like cwa.sh above: $0 is the *calling* script when the
+# daemon sources this file, so dirname $0 points at the wrong place there.
+[ -r "$(dirname "$CONF")/state.sh" ] && . "$(dirname "$CONF")/state.sh"
+command -v st_migrate >/dev/null 2>&1 && st_migrate "$OUT" "${STATEDIR:-/var/local/kfx-state}"
 
 keyof() {
     n=$(basename "$1"); n=${n%.kfx-zip}; n=${n%.kfx}
@@ -177,7 +184,7 @@ mark_dec()  { :; }
 n_synced() { grep -cE '^B[A-Z0-9]{9}$' "$SYNCED_CACHE" 2>/dev/null || echo 0; }
 n_dec() { [ -s "$SYNCED_CACHE" ] && n_synced || echo '-'; }
 n_up()  { n_dec; }
-n_bad() { sort -u "$FAILED" 2>/dev/null | wc -l | tr -d ' '; }
+n_bad() { st_count failed; }
 # One number for "things went wrong", whatever the cause. The detail screen
 # separates them, because the fixes differ.
 n_problems() { echo $(( $(n_bad) + $(n_stalled) )); }
@@ -432,6 +439,16 @@ purge_synced() {
             rm -rf "$d" 2>/dev/null && freed=$((freed + ${kb:-0}))
         done
         [ "$found" = 1 ] && books=$((books + 1))
+        # Calibre has it and the local copy is gone: that is the end of this
+        # book's story, and the last chance to say so. Nothing else runs for a
+        # book that no longer exists on the device -- which is exactly how the
+        # old .failed list kept reporting books that had long since arrived.
+        # Only for books this Kindle actually handled: the confirmation list is
+        # the whole library, and recording all of it would turn our account of
+        # what we did into a copy of Calibre's catalogue.
+        if [ "$found" = 1 ] || st_line "$_pg_asin" >/dev/null 2>&1; then
+            st_set "$_pg_asin" stage=confirmed note=-
+        fi
     done < "$list"
     rm -f "$list"
     if [ "$books" -gt 0 ]; then
@@ -709,28 +726,14 @@ note_wedge_sign() { printf '%s %s\n' "$(date +%s)" "${1:-?}" >> "$WEDGEFILE"; }
 
 # How many UI restarts this book has already caused. Kept on /var/local: the
 # restart tears down the UI (and /tmp survives, but a reboot does not).
-recover_book_file() { printf '%s/recover-books' "${STATEDIR:-/var/local/kfx-state}"; }
-recover_count() {   # $1 = asin
-    _rc_n=$(awk -v a="$1" '$1 == a {print $2; exit}' "$(recover_book_file)" 2>/dev/null)
+# How many UI restarts this book has already cost. Two, then it is left alone:
+# a book that genuinely cannot be downloaded must not restart the UI forever.
+# It is a field on the book's record, so it cannot outlive the book.
+recover_count() { _rc_n=$(st_get "$1" restarts 2>/dev/null)
     case "$_rc_n" in ''|*[!0-9]*) echo 0 ;; *) echo "$_rc_n" ;; esac
 }
-# Rewritten through a temp file rather than sed -i: this count decides whether
-# the UI gets restarted again, so it must not depend on which sed is in play,
-# and a stale duplicate line would be read instead of the current count.
-note_recover() {   # $1 = asin -- one more restart blamed on this book
-    _nr_f=$(recover_book_file); _nr_n=$(( $(recover_count "$1") + 1 ))
-    mkdir -p "${STATEDIR:-/var/local/kfx-state}" 2>/dev/null
-    {   [ -f "$_nr_f" ] && grep -v "^$1 " "$_nr_f"
-        printf '%s %s %s\n' "$1" "$_nr_n" "$(date +%s)"
-    } > "$_nr_f.new.$$" && mv "$_nr_f.new.$$" "$_nr_f"
-}
-clear_recover_count() {   # $1 = asin -- it downloaded, so it is not a problem book
-    _cr_f=$(recover_book_file)
-    [ -f "$_cr_f" ] || return 0
-    grep -v "^$1 " "$_cr_f" > "$_cr_f.new.$$" 2>/dev/null
-    [ -f "$_cr_f.new.$$" ] && mv "$_cr_f.new.$$" "$_cr_f"
-    return 0
-}
+note_recover() { st_bump "$1" restarts; }
+clear_recover_count() { st_set "$1" restarts=0; }
 
 back_off() {   # $1 = asin
     _bo_n=$(awk -v a="$1" '$1==a {print $3; exit}' "$STUCKLIST" 2>/dev/null)
@@ -900,7 +903,8 @@ mobi_enc() {
 # is left alone and says why.
 send_azw3() {   # $1 = asin, $2 = .azw3 path
     _az_k=$(key_of "$2")
-    _az_n=$(awk -F'\t' -v k="$_az_k" '$1 == k' "$CWA_UPLOADS" 2>/dev/null | wc -l | tr -d ' ')
+    _az_n=$(st_get "$_az_k" tries 2>/dev/null)
+    case "$_az_n" in ''|*[!0-9]*) _az_n=0 ;; esac
     if [ "${_az_n:-0}" -ge "$MAX_RETRIES" ]; then
         flog "NOT SENT: sent ${_az_n} times, Calibre never confirmed it"
         return 1
@@ -954,6 +958,7 @@ handle_one_book() {   # $1 = asin
     fi
     base=$(basename "$book" .kfx); zip="$OUT/$base.kfx-zip"
     if dec_known "$base" && [ -f "$zip" ]; then
+        st_set "$a" stage=decrypted note=-
         flog "DECRYPTION: already done"
     else
         # Keep what the tool said: a bare "FAILED" explains nothing, and this
@@ -961,13 +966,19 @@ handle_one_book() {   # $1 = asin
         [ -f "$RUNNER" ] || flog "DECRYPT TOOL MISSING: $RUNNER"
         "$RUNNER" dedrm "$book" "$OUT" > "$OUT/.dedrm-last.log" 2>&1 </dev/null
         if [ -f "$zip" ]; then
-            mark_dec "$base"; P_DEC=$((P_DEC + 1)); flog "DECRYPTION: Success"
+            mark_dec "$base"
+            # The record is the only account of this book, so the failure that
+            # may precede this is replaced, not annotated.
+            st_set "$a" stage=decrypted note=- "title=$(title_of "$a")"
+            P_DEC=$((P_DEC + 1)); flog "DECRYPTION: Success"
         else
-            echo "$base" >> "$FAILED"; P_FAIL=$((P_FAIL + 1))
+            P_FAIL=$((P_FAIL + 1))
             flog "DECRYPTION: FAILED"
             _hb_why=$(grep -a -i -E "error|fail|cannot|unable|no key|voucher|unsupported|not.*mobi|topaz" \
                         "$OUT/.dedrm-last.log" 2>/dev/null | tail -1 | cut -c1-64)
             [ -n "$_hb_why" ] && flog "REASON: $_hb_why"
+            st_set "$a" stage=failed "note=${_hb_why:-no reason given}" \
+                   "title=$(title_of "$a")"
             cp "$OUT/.dedrm-last.log" "$OUT/.dedrm-failed-$base.log" 2>/dev/null
             return 1
         fi
@@ -990,8 +1001,10 @@ handle_one_book() {   # $1 = asin
     else
         QUIET_UP=1
         if upload_one "$zip"; then
+            st_set "$a" stage=uploaded note=-
             P_UP=$((P_UP + 1)); flog "SENT TO $DEST_UC: Success"
         else
+            st_set "$a" stage=failed "note=upload: ${CWA_LAST:-failed}"
             P_FAIL=$((P_FAIL + 1)); flog "SENT TO $DEST_UC: FAILED"
         fi
         QUIET_UP=0
@@ -2196,19 +2209,32 @@ books_menu() {
 recent_uploads_cwa() {
     clear 2>/dev/null
     rule; printf ' recently sent to Calibre\n'; rule; echo
-    if [ -s "$CWA_UPLOADS" ]; then
-        tail -20 "$CWA_UPLOADS" | sed '1!G;h;$!d' | while IFS='	' read -r _ru_k _ru_t _ru_n; do
+    # Straight from the book records: everything we sent, most recent first.
+    _ru_any=0
+    for _ru_st in uploaded confirmed; do
+        st_keys "$_ru_st" >> /tmp/kfxsync.sent.$$ 2>/dev/null
+    done
+    if [ -s /tmp/kfxsync.sent.$$ ]; then
+        _ru_any=1
+        while read -r _ru_k; do
+            printf '%s\t%s\n' "$(st_get "$_ru_k" since)" "$_ru_k"
+        done < /tmp/kfxsync.sent.$$ | sort -rn | head -20 | while IFS='	' read -r _ru_t _ru_k; do
             _ru_a=${_ru_k%_sample}
-            case "$_ru_k" in
-                B*) if cwa_has "$_ru_a"; then _ru_s="in Calibre"; else _ru_s="waiting"; fi ;;
-                *)  _ru_s="sent" ;;
+            case "$(st_stage "$_ru_k")" in
+                confirmed) _ru_s="in Calibre" ;;
+                *)         case "$_ru_k" in
+                               B*) if cwa_has "$_ru_a"; then _ru_s="in Calibre"; else _ru_s="waiting"; fi ;;
+                               *)  _ru_s="sent" ;;
+                           esac ;;
             esac
-            _ru_title=$(title_of "$_ru_a"); [ -n "$_ru_title" ] || _ru_title=$_ru_n
+            _ru_title=$(title_of "$_ru_a")
+            [ -n "$_ru_title" ] || _ru_title=$(st_get "$_ru_k" title)
             printf '   %s  %-10s %s\n' "$(fmt_day "$_ru_t")" "$_ru_s" "$(short "$_ru_title" $((W - 30)))"
         done
     else
         printf '   nothing sent yet\n'
     fi
+    rm -f /tmp/kfxsync.sent.$$
     echo; printf ' [enter] > '; read _x 2>/dev/null
 }
 
@@ -2253,9 +2279,10 @@ list_problems() {
     clear 2>/dev/null
     rule; printf ' problems\n'; rule; echo
     printf '  Failed to decrypt (%s):\n' "$(n_bad)"
-    if [ -s "$FAILED" ]; then
-        sort -u "$FAILED" 2>/dev/null | head -12 | while read -r _pb; do
-            printf '    %s\n' "$(short "$_pb" $((W - 6)))"
+    if [ "$(n_bad)" -gt 0 ]; then
+        st_keys failed | head -12 | while read -r _pb; do
+            printf '    %s\n' "$(short "$(title_of "$_pb")" $((W - 6)))"
+            printf '      %s\n' "$(short "$(st_get "$_pb" note)" $((W - 8)))"
         done
     else
         printf '    none\n'
