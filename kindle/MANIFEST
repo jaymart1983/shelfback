@@ -9,4 +9,5 @@ kfx-daemon.sh
 kfx-update.sh
 launch.sh
 kual-status.sh
+serve-logs.sh
 menu.json

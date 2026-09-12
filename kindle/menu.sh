@@ -1852,32 +1852,45 @@ ftp_unserve() {   # $1 = port, $2 = pid file
     fw_close "$1"
 }
 
-# --- the read-only log server -------------------------------------------
+# --- the read-only log server (anonymous HTTP) --------------------------
+# ftpd needs a login, so it cannot be anonymous. This serves the logs over HTTP
+# through tcpsvd instead: no account, read-only by construction (serve-logs.sh
+# only ever reads files from LOGDIR). Open a browser at http://<ip>:<port>/.
+LOGSERVER=${LOGSERVER:-$(dirname "$CONF")/serve-logs.sh}
 log_ftp_running() { server_up "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; }
 log_ftp_ours()    { pids_alive "$REMOTE_LOG_PIDS"; }
 log_ftp_wanted()  { [ ! -f "$REMOTE_LOG_OFF" ]; }
-log_ftp_stop()    { ftp_unserve "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; }
+log_ftp_stop() {
+    [ -s "$REMOTE_LOG_PIDS" ] && while read -r _lp; do kill "$_lp" 2>/dev/null; done < "$REMOTE_LOG_PIDS"
+    rm -f "$REMOTE_LOG_PIDS"
+    fw_close "$REMOTE_LOG_PORT"
+}
 log_ftp_ensure() {
     log_ftp_wanted || { log_ftp_running && log_ftp_stop; return 0; }
     if log_ftp_running; then
-        # Already listening. Open the firewall if it is not open -- a server
-        # started before this build, or before the rule was added, is running
-        # and unreachable, which is exactly the state that wasted a morning.
-        #
-        # But ONLY for a server we started. Something else on this port could
-        # be anything, including an older build serving all of /mnt/us
-        # read-write; opening the firewall for that would turn a broken
-        # feature into an exposure.
+        # Already listening: open the firewall if it is not, but only for a
+        # server we started. Anything else on this port could be serving
+        # something we would not want exposed.
         if log_ftp_ours; then
             fw_is_open "$REMOTE_LOG_PORT"; [ "$?" = 1 ] && fw_open "$REMOTE_LOG_PORT"
         fi
         return 0
     fi
+    [ -x "$LOGSERVER" ] || { command -v tcpsvd >/dev/null 2>&1 || return 1; }
     mkdir -p "$LOGDIR" 2>/dev/null
-    # No -w. The server cannot write, whatever the client asks for.
-    ftp_serve "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS" "$LOGDIR" || return 1
-    emit "logs readable at ftp://$(device_ip):$REMOTE_LOG_PORT/ (read-only)"
-    return 0
+    command -v tcpsvd >/dev/null 2>&1 || return 1
+    : > "$REMOTE_LOG_PIDS"
+    LOGDIR="$LOGDIR" setsid tcpsvd -vE 0.0.0.0 "$REMOTE_LOG_PORT" sh "$LOGSERVER" >/dev/null 2>&1 &
+    echo $! >> "$REMOTE_LOG_PIDS"
+    sleep 2
+    if server_up "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; then
+        fw_open "$REMOTE_LOG_PORT"
+        emit "logs readable at http://$(device_ip):$REMOTE_LOG_PORT/ (anonymous, read-only)"
+        return 0
+    fi
+    while read -r _lp; do kill "$_lp" 2>/dev/null; done < "$REMOTE_LOG_PIDS" 2>/dev/null
+    rm -f "$REMOTE_LOG_PIDS"
+    return 1
 }
 
 # --- the read-write dev server ------------------------------------------
@@ -1965,6 +1978,93 @@ remote_text() {
     else _rt_d="Off"; fi
 
     printf 'Logs (%s), Dev (%s)' "$_rt_l" "$_rt_d"
+}
+
+# --- creating the dev FTP account ------------------------------------------
+# ftpd authenticates against the system accounts, so the read-write dev server
+# needs a real one. This makes a locked-down user (no login shell, home in
+# /mnt/us) by writing /etc/passwd and /etc/shadow -- which live on the
+# read-only rootfs, so it is the one thing here that can break the device's own
+# login if it goes wrong. Hence: back up both files first, only ever APPEND or
+# replace our own line (never touch root), validate the result parses and still
+# has root, and restore the backups if anything looks wrong. The rootfs is put
+# back read-only at the end whatever happens.
+FTP_USER=${FTP_USER:-kfx}
+PASSWD_FILE=${PASSWD_FILE:-/etc/passwd}
+SHADOW_FILE=${SHADOW_FILE:-/etc/shadow}
+ACCT_BACKUP=${ACCT_BACKUP:-$LOGDIR/etc-backup}
+# Hooks so the logic can be tested off-device: in a test these become ":".
+REMOUNT_RW=${REMOUNT_RW:-mount -o remount,rw /}
+REMOUNT_RO=${REMOUNT_RO:-mount -o remount,ro /}
+
+# Hash a password with whatever this build has. Prints the hash, or nothing.
+hash_password() {   # $1 = plaintext
+    if command -v cryptpw >/dev/null 2>&1; then
+        printf '%s' "$1" | cryptpw -m sha512 2>/dev/null && return 0
+    fi
+    if command -v mkpasswd >/dev/null 2>&1; then
+        mkpasswd -m sha512 "$1" 2>/dev/null && return 0
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        openssl passwd -6 "$1" 2>/dev/null && return 0   # -6 = sha512
+    fi
+    return 1
+}
+
+acct_exists() { cut -d: -f1 "$PASSWD_FILE" 2>/dev/null | grep -qx "$FTP_USER"; }
+
+# Returns: 0 made/updated, 1 could not hash, 2 rootfs not writable, 3 validation
+# failed (and was rolled back).
+create_ftp_user() {   # $1 = plaintext password
+    _cu_hash=$(hash_password "$1")
+    [ -n "$_cu_hash" ] || return 1
+
+    $REMOUNT_RW 2>/dev/null || return 2
+    # Prove it really is writable, not just remounted.
+    if ! { : > "$PASSWD_FILE.kfxtest" ; } 2>/dev/null; then
+        $REMOUNT_RO 2>/dev/null; return 2
+    fi
+    rm -f "$PASSWD_FILE.kfxtest" 2>/dev/null
+
+    mkdir -p "$ACCT_BACKUP" 2>/dev/null
+    _cu_ts=$(date +%s)
+    cp "$PASSWD_FILE" "$ACCT_BACKUP/passwd.$_cu_ts" 2>/dev/null
+    cp "$SHADOW_FILE" "$ACCT_BACKUP/shadow.$_cu_ts" 2>/dev/null
+
+    # An unused uid/gid at the top of the range.
+    _cu_uid=$(awk -F: 'BEGIN{m=9000} $3+0>m && $3+0<20000 {m=$3} END{print m+1}' "$PASSWD_FILE" 2>/dev/null)
+    case "$_cu_uid" in ''|*[!0-9]*) _cu_uid=9001 ;; esac
+
+    # Build both files without our old line, then append the new one. Editing
+    # in a temp and moving means a half-written file is never the live one.
+    grep -v "^$FTP_USER:" "$PASSWD_FILE" > "$PASSWD_FILE.new.$$" 2>/dev/null
+    printf '%s:x:%s:%s:kfx ftp:/mnt/us:/bin/false\n' "$FTP_USER" "$_cu_uid" "$_cu_uid" >> "$PASSWD_FILE.new.$$"
+    grep -v "^$FTP_USER:" "$SHADOW_FILE" > "$SHADOW_FILE.new.$$" 2>/dev/null
+    printf '%s:%s:19000:0:99999:7:::\n' "$FTP_USER" "$_cu_hash" >> "$SHADOW_FILE.new.$$"
+
+    # Validate before committing: every passwd line has 7 fields, root is still
+    # there, and our user is present exactly once.
+    if ! awk -F: 'NF!=7{bad=1} END{exit bad}' "$PASSWD_FILE.new.$$" 2>/dev/null \
+       || ! grep -q '^root:' "$PASSWD_FILE.new.$$" \
+       || [ "$(grep -c "^$FTP_USER:" "$PASSWD_FILE.new.$$")" != 1 ] \
+       || ! grep -q '^root:' "$SHADOW_FILE.new.$$"; then
+        rm -f "$PASSWD_FILE.new.$$" "$SHADOW_FILE.new.$$"
+        $REMOUNT_RO 2>/dev/null
+        return 3
+    fi
+
+    mv "$PASSWD_FILE.new.$$" "$PASSWD_FILE" 2>/dev/null
+    mv "$SHADOW_FILE.new.$$" "$SHADOW_FILE" 2>/dev/null
+
+    # Final guard: if root vanished from either file, put the backups back.
+    if ! grep -q '^root:' "$PASSWD_FILE" || ! grep -q '^root:' "$SHADOW_FILE"; then
+        cp "$ACCT_BACKUP/passwd.$_cu_ts" "$PASSWD_FILE" 2>/dev/null
+        cp "$ACCT_BACKUP/shadow.$_cu_ts" "$SHADOW_FILE" 2>/dev/null
+        $REMOUNT_RO 2>/dev/null
+        return 3
+    fi
+    $REMOUNT_RO 2>/dev/null
+    return 0
 }
 
 device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
@@ -2240,6 +2340,7 @@ settings_menu() {
         printf '   6) Calibre login\n'
         printf '   7) Dev FTP (read-write, port %s): %s\n' \
         "$REMOTE_DEV_PORT" "$(remote_wanted && echo ON || echo off)"
+        printf '   8) FTP login: %s\n' "$(acct_exists && echo "set ($FTP_USER)" || echo "not created")"
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -2260,12 +2361,15 @@ settings_menu() {
                    emit "dev access: turned off"
                    printf '   Dev access is off.\n'
                    printf '   Logs stay readable on port %s.\n' "$REMOTE_LOG_PORT"
+               elif ! acct_exists; then
+                   printf '   No FTP login yet. Create one first with\n'
+                   printf '   option 8, then turn this on.\n'
                else
                    printf '   Opens a SECOND FTP server on port %s, serving\n' "$REMOTE_DEV_PORT"
-                   printf '   all of /mnt/us, READ AND WRITE, as root with no\n'
-                   printf '   password. That is every book on the device, and\n'
-                   printf '   cwa.conf with your Calibre password in it.\n\n'
-                   printf '   The read-only log server on %s is unaffected.\n' "$REMOTE_LOG_PORT"
+                   printf '   all of /mnt/us READ AND WRITE -- every book, and\n'
+                   printf '   cwa.conf with your Calibre password. Log in as the\n'
+                   printf '   "%s" account you created.\n\n' "$FTP_USER"
+                   printf '   The anonymous log server on %s is unaffected.\n' "$REMOTE_LOG_PORT"
                    printf '   This stays on until you turn it off here.\n\n'
                    printf '   type YES to turn it on > '
                    read _ra 2>/dev/null
@@ -2273,8 +2377,8 @@ settings_menu() {
                        remote_want_on
                        if remote_start; then
                            emit "dev access: ftp://$(device_ip):$REMOTE_DEV_PORT/ read-write, via $REMOTE_HOW"
-                           printf '\n   on (%s): ftp://%s:%s/\n' "$REMOTE_HOW" "$(device_ip)" "$REMOTE_DEV_PORT"
-                           printf '   it stays on, through a UI restart, until turned off\n'
+                           printf '\n   on: ftp://%s@%s:%s/\n' "$FTP_USER" "$(device_ip)" "$REMOTE_DEV_PORT"
+                           printf '   stays on, through a UI restart, until turned off\n'
                        else
                            printf '\n   could not start: %s\n' "$REMOTE_HOW"
                            printf '   left ON, so the daemon will keep trying\n'
@@ -2282,6 +2386,32 @@ settings_menu() {
                    else
                        printf '\n   cancelled\n'
                    fi
+               fi
+               echo; printf ' [enter] > '; read _x 2>/dev/null ;;
+            8) clear 2>/dev/null; echo
+               printf '   Creates the "%s" FTP login used by the dev server.\n' "$FTP_USER"
+               printf '   This writes /etc/passwd and /etc/shadow on the\n'
+               printf '   device. Both are backed up first, root is never\n'
+               printf '   touched, and the change is undone if anything looks\n'
+               printf '   wrong -- but it is the one setting that edits the\n'
+               printf '   system, so it asks before doing it.\n\n'
+               printf '   a no-login account, home /mnt/us, for FTP only.\n\n'
+               printf '   type a password for it (blank to cancel) > '
+               read _pw 2>/dev/null
+               if [ -z "$_pw" ]; then
+                   printf '\n   cancelled\n'
+               else
+                   create_ftp_user "$_pw"
+                   case "$?" in
+                       0) printf '\n   login "%s" is ready.\n' "$FTP_USER"
+                          printf '   turn on Dev FTP (option 7) to use it.\n' ;;
+                       1) printf '\n   no password-hashing tool on this device\n'
+                          printf '   (need cryptpw, mkpasswd or openssl)\n' ;;
+                       2) printf '\n   the system files are not writable here.\n'
+                          printf '   the root filesystem would not remount.\n' ;;
+                       3) printf '\n   the change did not validate and was undone.\n'
+                          printf '   nothing was altered.\n' ;;
+                   esac
                fi
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
             3) clear 2>/dev/null
