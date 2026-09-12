@@ -141,10 +141,14 @@ again.
   running an older build, so relaunching is enough after a deploy.
 - **Settings -> Calibre login** changes the address, username or password on the
   device, and tests the login straight away.
-- **Settings -> Remote access (dev)** puts an FTP server on `/mnt/us` for 30
-  minutes, for pulling the log and pushing a test script without a USB cable.
-  It serves as root with no password, so it is off by default, has to be
-  confirmed, and stops by itself.
+- **U) Check for updates** asks the update daemon to look now; it also checks
+  every couple of hours by itself. See [updating](#updating).
+- **Settings -> Remote access (dev)** puts an FTP server on `/mnt/us` for
+  pulling the log and pushing a test script without a USB cable. It serves as
+  root with **no password**, so it is off by default and has to be confirmed --
+  but once on it stays on until you turn it off, because waiting for the next
+  jam can take hours. The daemon puts it back after the framework restart that
+  clears a jam.
 
 ### When something is wrong
 
@@ -156,6 +160,45 @@ again.
 | `DECRYPTION: FAILED` + `REASON:` | What `kfxdedrm` said. Its full output is in `/mnt/us/dedrm/.dedrm-last.log`. |
 | `WAITING FOR PART` | A piece of a multi-file book has not downloaded yet. |
 | A book stays **Sent** | Calibre has it but `backfill-asins` has not recorded its Amazon ID yet. |
+
+## Updating
+
+The device can update itself from this repository, so a fix does not need a
+cable:
+
+- `kindle/VERSION` is the release. **Committing a new VERSION publishes an
+  update**; committing the old one rolls it back.
+- `kindle/MANIFEST` lists the files a release is made of.
+- `kfx-update.sh` is a second daemon, separate from the sync daemon because the
+  thing that restarts the sync daemon cannot be the sync daemon. It compares
+  the two VERSIONs, fetches every file the manifest names, and installs only if
+  all of them arrive.
+
+It does not trust the download. Every `.sh` must parse; a file starting with
+`<` is a web page, not a script; a version that is not a build stamp is
+refused; and a manifest name containing a slash or a leading dot is refused
+before it becomes a path. The previous release is kept, and **if the sync
+daemon will not start on the new code, the old code goes back** and the daemon
+is restarted on it. A failed update has to leave a working Kindle, because the
+alternative is finding a USB cable.
+
+The build number shown on screen always means "the code that is running": the
+incoming `menu.sh` is stamped with the version being installed.
+
+```sh
+kfx-update.sh check      # one cycle now, printing what happened
+kfx-update.sh status     # what is installed, and is the daemon up
+kfx-update.sh request    # ask a running daemon to check
+```
+
+### Driving it without a cable
+
+`/mnt/us/extensions/kfx-sync/command` holds **one word**, is read once and
+deleted, and accepts only: `run`, `stop`, `restart-ui`, `update`, `remote-on`,
+`remote-off`. Write it over FTP and the daemon acts on it within a tick.
+Nothing in that vocabulary reboots the device or deletes anything: whoever can
+write the file is whoever can reach the FTP port, which is not a reason to
+trust them with more.
 
 ## The jam
 
@@ -184,6 +227,9 @@ kindle/      what runs on the Kindle
   kual-status.sh     the one-line status KUAL shows beside the entry
   menu.sh            the front end, and every sync step
   kfx-daemon.sh      the background process: timed syncs, jam recovery
+  kfx-update.sh      the update daemon: pull, verify, install, roll back
+  MANIFEST           the files a release is made of
+  VERSION            the release; committing a new one publishes an update
   cwa.sh             talking to Calibre-Web: login, book list, upload
   deploy.sh          copy to a mounted Kindle, stamping a build number
   install-boot-hook.sh   start the background process after a reboot

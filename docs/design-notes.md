@@ -119,6 +119,37 @@ up. Retrying with jitter is the whole difference.
   reads the result back byte-for-byte. Used to rebuild a book's archive when a
   piece arrives late.
 
+## Updating a device whose only other way in is a cable
+
+The update daemon is separate from the sync daemon for one reason: it restarts
+the sync daemon, and a process cannot reliably restart itself. Keeping them
+apart also means a release that breaks the sync daemon outright still leaves a
+process running that can fetch the next one.
+
+What the checks are actually for, in the order they have mattered:
+
+- **`sh -n` on every shell file.** A truncated download is the common failure
+  on a device that loses wifi mid-transfer, and half a shell script is valid
+  text but not a valid program.
+- **A leading `<` is a web page.** `curl` without `-f` writes a 404 body to the
+  output file, so a renamed file upstream arrives as HTML with a 200-shaped
+  filename.
+- **The version must be digits and dots.** It is read from the network and then
+  compared, logged and stamped into `menu.sh`.
+- **Manifest names must be plain.** They come from the network and become paths
+  under the staging directory; a slash or a leading dot is refused rather than
+  sanitised.
+
+Rollback is the part worth having: install, restart the sync daemon, and if it
+does not come up, put the previous files back and restart it on those. The
+fallback if that fails too is a USB cable, which is exactly what this exists to
+avoid.
+
+One bug found in testing that is easy to write: the updater re-execs itself
+after installing, because the file on disk is new while the running process is
+old. Done unconditionally, `kfx-update.sh check` typed at a prompt turns into a
+background daemon and never returns. It re-execs only when it is the daemon.
+
 ## What the Kindle can reach, and what it can host
 
 Measured 11 Sep 2026 on this device (curl 7.86.0, OpenSSL 1.0.2q, 2018):

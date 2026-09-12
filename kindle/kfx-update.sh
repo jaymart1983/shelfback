@@ -195,9 +195,11 @@ check_once() {
         UPDATE_LAST="rolled back"
         return 1
     fi
-    # Replace ourselves last, and only by starting again: this process is
-    # running the old code until it does.
-    if [ -x "$BASE/kfx-update.sh" ] && [ "${UPDATE_REEXEC:-1}" = 1 ]; then
+    # This process is still running the old updater, and the file on disk is
+    # now the new one, so start again on it. Only when we ARE the daemon:
+    # "kfx-update.sh check" by hand must return to the prompt, not quietly
+    # become a background loop.
+    if [ "${IN_LOOP:-0}" = 1 ] && [ -x "$BASE/kfx-update.sh" ] && [ "${UPDATE_REEXEC:-1}" = 1 ]; then
         ulog "re-exec on the new updater"
         UPDATE_REEXEC=0 exec sh "$BASE/kfx-update.sh" loop
     fi
@@ -216,6 +218,7 @@ update_pids() {
 }
 
 loop() {
+    IN_LOOP=1
     echo $$ > "$UPDATE_PID"
     trap 'rm -f "$UPDATE_PID"; exit 0' INT TERM HUP
     ulog "update daemon started, installed version $(local_version)"
