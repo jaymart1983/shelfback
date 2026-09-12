@@ -35,7 +35,7 @@ file, so there is nothing to piece together.
 
 | Where | What |
 |---|---|
-| Kindle | A jailbroken Kindle with [KUAL][kual] and `kterm`, and the `kfxdedrm` scriptlet installed at `/mnt/us/extensions/kfxdedrm-scriptlet`. |
+| Kindle | A jailbroken Kindle with `kterm` and the `kfxdedrm` scriptlet at `/mnt/us/extensions/kfxdedrm-scriptlet`. It is launched as a [scriptlet][scriptlet] -- a `.sh` file in `documents/` with a `# Name:` header, which shows up in the library as a book you open. [KUAL][kual] works too, if you have it. |
 | Server | [Calibre-Web Automated][cwa] in Docker, with the **KFX Input** plugin (and **DeDRM** if you want the fallback). |
 | Server | Anything that runs cron and can `docker exec` into that container. Written on Unraid; nothing depends on Unraid itself. |
 | Calibre-Web | A user account for the Kindle with **upload**, **download** and **view** permissions. It does not need to be an admin. |
@@ -49,8 +49,11 @@ books in flight.
 
 ```sh
 # from a checkout, with the Kindle mounted over USB
-kindle/deploy.sh                    # copies the scripts and stamps a build number
+kindle/deploy.sh    # copies the scripts, installs the launcher, stamps a build number
 ```
+
+The launcher lands in `documents/` as **00 KFX Sync**, which is what you open on
+the device.
 
 Then create two files in `/mnt/us/extensions/kfx-sync/`:
 
@@ -78,8 +81,9 @@ Optional, so the sync survives a reboot:
 sh /mnt/us/extensions/kfx-sync/install-boot-hook.sh
 ```
 
-Launch **KFX Sync** from KUAL. The top right shows the build number; the first
-line shows whether Calibre is reachable.
+Then open **KFX Sync** from the library -- or from KUAL, if you use it. The top
+right shows the build number; the first line shows whether Calibre is
+reachable.
 
 ### On the server
 
@@ -158,6 +162,7 @@ hour. See [docs/design-notes.md](docs/design-notes.md).
 
 ```
 kindle/      what runs on the Kindle
+  KFX Sync.sh        the launcher, copied into documents/ as "00 KFX Sync"
   menu.sh            the front end, and every sync step
   kfx-daemon.sh      the background process: timed syncs, jam recovery
   cwa.sh             talking to Calibre-Web: login, book list, upload
@@ -176,3 +181,4 @@ scripts before running them.
 
 [cwa]: https://github.com/crocodilestick/Calibre-Web-Automated
 [kual]: https://www.mobileread.com/forums/showthread.php?t=203326
+[scriptlet]: https://www.mobileread.com/forums/showthread.php?t=323568
