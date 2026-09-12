@@ -1778,7 +1778,21 @@ remote_wanted()  { [ -f "$REMOTE_FLAG" ]; }
 remote_want_on() { mkdir -p "$(dirname "$REMOTE_FLAG")" 2>/dev/null; : > "$REMOTE_FLAG"; }
 remote_want_off(){ rm -f "$REMOTE_FLAG" 2>/dev/null; }
 
+# "A process exists" is not "a server is listening". The first version checked
+# only that the pid it backgrounded was alive, so a super-server that started
+# and failed to bind still reported an address the menu happily printed -- and
+# nothing answered on the port. Ask the kernel instead.
+NETSTAT=${NETSTAT:-netstat}
+remote_listening() {
+    command -v "$NETSTAT" >/dev/null 2>&1 || return 2   # cannot tell
+    "$NETSTAT" -ln 2>/dev/null | grep -q "[:.]$REMOTE_PORT[^0-9]" && return 0
+    return 1
+}
+
 remote_running() {
+    # If netstat can answer, its answer is the truth.
+    remote_listening
+    case "$?" in 0) return 0 ;; 1) return 1 ;; esac
     [ -s "$REMOTE_PIDS" ] || return 1
     while read -r _rr_p; do kill -0 "$_rr_p" 2>/dev/null && return 0; done < "$REMOTE_PIDS"
     return 1
@@ -1791,22 +1805,42 @@ remote_stop() {
 
 # busybox ftpd expects to be handed a connected socket, so it needs a small
 # super-server in front. Whichever of these this build has, we use.
+# busybox ftpd expects to be handed a connected socket, so it needs something in
+# front of it. Try each thing this build might have, and believe none of them
+# until the port is actually listening.
 remote_start() {
     command -v ftpd >/dev/null 2>&1 || { REMOTE_HOW="no ftpd on this device"; return 1; }
-    : > "$REMOTE_PIDS"
-    if command -v tcpsvd >/dev/null 2>&1; then
-        setsid tcpsvd -vE 0.0.0.0 "$REMOTE_PORT" ftpd -w /mnt/us >/dev/null 2>&1 &
-        echo $! >> "$REMOTE_PIDS"; REMOTE_HOW="tcpsvd"
-    elif command -v inetd >/dev/null 2>&1; then
-        printf '%s stream tcp nowait root ftpd ftpd -w /mnt/us\n' "$REMOTE_PORT" > /tmp/kfx-inetd.conf
-        setsid inetd -f /tmp/kfx-inetd.conf >/dev/null 2>&1 &
-        echo $! >> "$REMOTE_PIDS"; REMOTE_HOW="inetd"
+    REMOTE_TRIED=""
+    for _rs_m in tcpsvd inetd nc; do
+        command -v "$_rs_m" >/dev/null 2>&1 || continue
+        : > "$REMOTE_PIDS"
+        case "$_rs_m" in
+            tcpsvd) setsid tcpsvd -vE 0.0.0.0 "$REMOTE_PORT" ftpd -w /mnt/us >/dev/null 2>&1 &
+                    echo $! >> "$REMOTE_PIDS" ;;
+            inetd)  printf '%s stream tcp nowait root ftpd ftpd -w /mnt/us\n' "$REMOTE_PORT" \
+                        > /tmp/kfx-inetd.conf
+                    setsid inetd -f /tmp/kfx-inetd.conf >/dev/null 2>&1 &
+                    echo $! >> "$REMOTE_PIDS" ;;
+            # Last resort: nc as its own super-server. -ll re-listens after each
+            # client; builds without -e cannot do this and simply fail here,
+            # which is why it is tried last and still verified below.
+            nc)     setsid nc -ll -p "$REMOTE_PORT" -e ftpd -w /mnt/us >/dev/null 2>&1 &
+                    echo $! >> "$REMOTE_PIDS" ;;
+        esac
+        REMOTE_TRIED="$REMOTE_TRIED $_rs_m"
+        sleep 2
+        if remote_running; then REMOTE_HOW="$_rs_m"; return 0; fi
+        # Did not bind: clean up before trying the next one, or the failed
+        # process lingers and the pid file lies about which server is which.
+        while read -r _rs_p; do kill "$_rs_p" 2>/dev/null; done < "$REMOTE_PIDS" 2>/dev/null
+        rm -f "$REMOTE_PIDS"
+    done
+    if [ -n "$REMOTE_TRIED" ]; then
+        REMOTE_HOW="tried$REMOTE_TRIED -- none of them listened on $REMOTE_PORT"
     else
-        REMOTE_HOW="no tcpsvd or inetd to host ftpd"; rm -f "$REMOTE_PIDS"; return 1
+        REMOTE_HOW="nothing on this device can host ftpd (no tcpsvd, inetd or nc)"
     fi
-    sleep 1
-    remote_running || { REMOTE_HOW="$REMOTE_HOW (it did not stay up)"; rm -f "$REMOTE_PIDS"; return 1; }
-    return 0
+    return 1
 }
 
 # From the daemon tick: if the toggle is on and the server is not up, put it
