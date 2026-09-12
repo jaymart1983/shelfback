@@ -18,6 +18,18 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 BUILD=$(date +%m%d%Y.%H%M)
 
+# Checked before anything is stamped: a refusal must leave the tree as it was,
+# not sitting on a version number that was never published.
+if [ "${1:-}" = "--commit" ]; then
+    _dirty=$(cd "$HERE/.." && git status --porcelain -- . \
+             | grep -v 'kindle/VERSION\|kindle/menu.sh' || true)
+    if [ -n "$_dirty" ]; then
+        echo "refusing: commit these first, or they are not in the release"
+        printf '%s\n' "$_dirty" | sed 's/^/  /'
+        exit 1
+    fi
+fi
+
 for f in menu.sh cwa.sh state.sh kfx-daemon.sh kfx-update.sh launch.sh kual-status.sh; do
     sh -n "$HERE/$f" || { echo "syntax error in $f -- not publishing"; exit 1; }
 done
@@ -34,16 +46,6 @@ _b=$(sed -n 's/^KFX_BUILD=\([0-9.]*\).*/\1/p' "$HERE/menu.sh" | head -1)
 echo "release $BUILD"
 if [ "${1:-}" = "--commit" ]; then
     cd "$HERE/.."
-    # A release must be everything, not just the two stamped files. Publishing
-    # on top of uncommitted work pushes a version number for code that is still
-    # on this laptop -- committed moments later, so it happens to work, and
-    # would not if the second push failed.
-    _dirty=$(git status --porcelain -- . | grep -v 'kindle/VERSION\|kindle/menu.sh' || true)
-    if [ -n "$_dirty" ]; then
-        echo "refusing: commit these first, or they are not in the release"
-        printf '%s\n' "$_dirty" | sed 's/^/  /'
-        exit 1
-    fi
     git add kindle/VERSION kindle/menu.sh
     git commit -q -m "Release $BUILD"
     git push -q origin main
