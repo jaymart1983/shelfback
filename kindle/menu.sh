@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09122026.1029   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09122026.1055   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -1854,11 +1854,25 @@ ftp_unserve() {   # $1 = port, $2 = pid file
 
 # --- the read-only log server -------------------------------------------
 log_ftp_running() { server_up "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; }
+log_ftp_ours()    { pids_alive "$REMOTE_LOG_PIDS"; }
 log_ftp_wanted()  { [ ! -f "$REMOTE_LOG_OFF" ]; }
 log_ftp_stop()    { ftp_unserve "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; }
 log_ftp_ensure() {
     log_ftp_wanted || { log_ftp_running && log_ftp_stop; return 0; }
-    log_ftp_running && return 0
+    if log_ftp_running; then
+        # Already listening. Open the firewall if it is not open -- a server
+        # started before this build, or before the rule was added, is running
+        # and unreachable, which is exactly the state that wasted a morning.
+        #
+        # But ONLY for a server we started. Something else on this port could
+        # be anything, including an older build serving all of /mnt/us
+        # read-write; opening the firewall for that would turn a broken
+        # feature into an exposure.
+        if log_ftp_ours; then
+            fw_is_open "$REMOTE_LOG_PORT"; [ "$?" = 1 ] && fw_open "$REMOTE_LOG_PORT"
+        fi
+        return 0
+    fi
     mkdir -p "$LOGDIR" 2>/dev/null
     # No -w. The server cannot write, whatever the client asks for.
     ftp_serve "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS" "$LOGDIR" || return 1
@@ -1873,9 +1887,15 @@ remote_want_on()  { mkdir -p "$(dirname "$REMOTE_FLAG")" 2>/dev/null; : > "$REMO
 remote_want_off() { rm -f "$REMOTE_FLAG" 2>/dev/null; }
 remote_stop()     { ftp_unserve "$REMOTE_DEV_PORT" "$REMOTE_PIDS"; }
 remote_start()    { ftp_serve "$REMOTE_DEV_PORT" "$REMOTE_PIDS" -w /mnt/us; }
+remote_ours() { pids_alive "$REMOTE_PIDS"; }
 remote_ensure() {
     remote_wanted || return 0
-    remote_running && return 0
+    if remote_running; then
+        if remote_ours; then
+            fw_is_open "$REMOTE_DEV_PORT"; [ "$?" = 1 ] && fw_open "$REMOTE_DEV_PORT"
+        fi
+        return 0
+    fi
     if remote_start; then
         emit "dev access: ftp://$(device_ip):$REMOTE_DEV_PORT/ read-write, via $REMOTE_HOW"
     fi
@@ -1927,14 +1947,20 @@ remote_text() {
     # fw_is_open returns 2 for "no iptables here, cannot tell", which is not
     # the same as "blocked" -- only a definite 1 means the port is shut.
     if log_ftp_running; then
-        fw_is_open "$REMOTE_LOG_PORT"; _rt_f=$?
-        if [ "$_rt_f" = 1 ]; then _rt_l="blocked"; else _rt_l=$REMOTE_LOG_PORT; fi
+        if ! log_ftp_ours; then _rt_l="busy"        # someone else holds the port
+        else
+            fw_is_open "$REMOTE_LOG_PORT"; _rt_f=$?
+            if [ "$_rt_f" = 1 ]; then _rt_l="blocked"; else _rt_l=$REMOTE_LOG_PORT; fi
+        fi
     elif log_ftp_wanted; then _rt_l="starting"
     else _rt_l="Off"; fi
 
     if remote_running; then
-        fw_is_open "$REMOTE_DEV_PORT"; _rt_f=$?
-        if [ "$_rt_f" = 1 ]; then _rt_d="blocked"; else _rt_d=$REMOTE_DEV_PORT; fi
+        if ! remote_ours; then _rt_d="busy"
+        else
+            fw_is_open "$REMOTE_DEV_PORT"; _rt_f=$?
+            if [ "$_rt_f" = 1 ]; then _rt_d="blocked"; else _rt_d=$REMOTE_DEV_PORT; fi
+        fi
     elif remote_wanted; then _rt_d="starting"
     else _rt_d="Off"; fi
 

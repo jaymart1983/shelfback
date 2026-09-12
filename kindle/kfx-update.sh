@@ -178,6 +178,12 @@ UPDATE_DUE=${UPDATE_DUE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_DUE}
 UPDATE_GO=${UPDATE_GO:-${STATEDIR:-/var/local/kfx-state}/UPDATE_GO}
 UPDATE_SEEN=${UPDATE_SEEN:-${STATEDIR:-/var/local/kfx-state}/UPDATE_SEEN}
 UPDATE_STATE=${UPDATE_STATE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_STATE}
+# Which build the RUNNING updater is, as opposed to which is installed. A
+# long-lived process keeps the code it started with: after an update, the one
+# on disk changed and this one did not. That is how an updater from an earlier
+# build stayed alive writing to that build's log path, while the daemon saw a
+# running updater and never started the new one.
+UPDATE_BUILD=${UPDATE_BUILD:-${STATEDIR:-/var/local/kfx-state}/UPDATE_BUILD}
 
 # One line the menu can show without reading a log: what happened last.
 set_state() { mkdir -p "$(dirname "$UPDATE_STATE")" 2>/dev/null
@@ -300,6 +306,8 @@ update_pids() {
 loop() {
     IN_LOOP=1
     echo $$ > "$UPDATE_PID"
+    mkdir -p "$(dirname "$UPDATE_BUILD")" 2>/dev/null
+    printf '%s\n' "$(local_version)" > "$UPDATE_BUILD" 2>/dev/null
     trap 'rm -f "$UPDATE_PID"; exit 0' INT TERM HUP
     ulog "update daemon started on $(local_version)"
     # Check immediately. The device may have been off for a week, and waiting a
@@ -347,7 +355,22 @@ case "${1:-status}" in
              : > "$UPDATE_REQ"
              if [ -n "$(update_pids)" ]; then echo "asked the update daemon to check"
              else echo "the update daemon is not running"; fi ;;
-    start)   if [ -n "$(update_pids)" ]; then echo "already running"; exit 0; fi
+    start)   # A running updater from an older build is not "already running":
+             # it is the previous version of this program, and it will keep
+             # using the previous version's paths and behaviour until replaced.
+             if [ -n "$(update_pids)" ]; then
+                 _sb=$(cat "$UPDATE_BUILD" 2>/dev/null)
+                 _sv=$(local_version)
+                 if [ -n "$_sv" ] && [ "$_sb" != "$_sv" ]; then
+                     ulog "updater is build ${_sb:-unknown}, installed is $_sv -- restarting it"
+                     for _p in $(update_pids); do kill "$_p" 2>/dev/null; done
+                     sleep 1
+                     for _p in $(update_pids); do kill -9 "$_p" 2>/dev/null; done
+                     rm -f "$UPDATE_PID"
+                 else
+                     echo "already running"; exit 0
+                 fi
+             fi
              setsid nohup sh "$0" loop >/dev/null 2>&1 &
              sleep 2
              if [ -n "$(update_pids)" ]; then echo "started"; else echo "FAILED to start"; exit 1; fi ;;
