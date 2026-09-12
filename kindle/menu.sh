@@ -1882,19 +1882,39 @@ remote_ensure() {
     return 0
 }
 
-# tcpsvd runs one ftpd per connection, so a live ftpd that is not the
-# super-server itself IS someone connected. Counting processes rather than
-# parsing a log means the screen is right the moment a client attaches and the
-# moment it drops, with nothing to clean up afterwards.
+# Who is connected, by address, from the kernel's own connection table.
+#
+# This used to count ftpd processes on the theory that tcpsvd runs one per
+# client. It does -- but a stray ftpd left behind by a crashed or killed client
+# counts just the same, and the panel then reports a connection that is not
+# there. An ESTABLISHED entry is a connection; a process is only evidence of
+# one. It also gives us the address, which is the useful part: "someone is
+# reading the logs" matters less than which machine it is.
+ftp_peers() {   # $1 = port -- one address per line, deduplicated
+    command -v "$NETSTAT" >/dev/null 2>&1 || return 0
+    "$NETSTAT" -tn 2>/dev/null | awk -v p="[:.]$1\$" '
+        $NF == "ESTABLISHED" && $4 ~ p {
+            addr = $5
+            sub(/[:.][0-9]+$/, "", addr)      # drop the peer port
+            if (addr != "") print addr
+        }' | sort -u
+}
+ftp_peer_count() { ftp_peers "$1" | grep -c . ; }
+
+# Both servers together, for the one-line "is anyone on this device" question.
 remote_clients() {
-    _rc_n=0
-    for _rc_d in "${PROCDIR:-/proc}"/[0-9]*; do
-        grep -qa 'ftpd' "$_rc_d/cmdline" 2>/dev/null || continue
-        grep -qa 'tcpsvd' "$_rc_d/cmdline" 2>/dev/null && continue
-        grep -qa 'inetd'  "$_rc_d/cmdline" 2>/dev/null && continue
-        _rc_n=$((_rc_n + 1))
-    done
+    _rc_n=$(( $(ftp_peer_count "$REMOTE_LOG_PORT") + $(ftp_peer_count "$REMOTE_DEV_PORT") ))
     printf '%s' "$_rc_n"
+}
+
+# The line the panel prints only when someone is actually connected.
+remote_peers_text() {
+    _rp_l=$(ftp_peers "$REMOTE_LOG_PORT" | tr '\n' ' ')
+    _rp_d=$(ftp_peers "$REMOTE_DEV_PORT" | tr '\n' ' ')
+    _rp_o=""
+    [ -n "$_rp_l" ] && _rp_o="Logs ${_rp_l%% }"
+    [ -n "$_rp_d" ] && _rp_o="${_rp_o:+$_rp_o  }Dev ${_rp_d%% }"
+    printf '%s' "$_rp_o"
 }
 
 # Both servers on one line, each saying where it is or that it is not there:
@@ -1929,6 +1949,10 @@ device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' |
 # state files and writes requests, so a slow or failing download can never hang
 # the menu.
 UPDATER=${UPDATER:-${BASE:-/mnt/us/extensions/kfx-sync}/kfx-update.sh}
+# The same default as kfx-update.sh, and overridden by the same config, so the
+# screen can say where it is looking. "Could not reach it" is a much more
+# useful sentence with the address attached.
+UPDATE_URL=${UPDATE_URL:-https://raw.githubusercontent.com/jaymart1983/shelfback/main/kindle}
 UPDATE_REQ=${UPDATE_REQ:-/var/local/kfx-update.req}
 UPDATE_AVAIL=${UPDATE_AVAIL:-${STATEDIR:-/var/local/kfx-state}/UPDATE_AVAIL}
 UPDATE_DUE=${UPDATE_DUE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_DUE}
@@ -2031,6 +2055,7 @@ updates_screen() {
     uline "Installed: $(stat_or "$(installed_version)")"
     _us_a=$(update_available)
     [ -n "$_us_a" ] && uline "Available: $_us_a"
+    uline "Source:    $UPDATE_URL/VERSION"
     echo
     uline "Checking for Updates"
     echo
@@ -2295,11 +2320,10 @@ draw() {
     # Someone reading or writing this Kindle's storage is worth more than a
     # column: it is a server with no password, and the owner should be able to
     # see it is in use without going looking.
-    _dr_c=$(remote_clients)
-    if [ "${_dr_c:-0}" -gt 0 ] && remote_running; then
-        printf ' >> DEV FTP IN USE (read-write): %s connection(s) to %s:%s\n' \
-            "$_dr_c" "$(device_ip)" "$REMOTE_DEV_PORT"
-    fi
+    # Only when someone is actually on it: a line that is always there stops
+    # being read, and this one is worth reading.
+    _dr_p=$(remote_peers_text)
+    [ -n "$_dr_p" ] && printf '%s\n' "$(short " connected: $_dr_p" "$W")"
     rule
     # Books.
     two ' decrypted:' "$(stat_or "$(state_get N_SYNCED)")" \

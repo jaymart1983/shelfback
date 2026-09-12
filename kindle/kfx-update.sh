@@ -200,7 +200,13 @@ check_once() {
     _co_have=$(local_version); _co_want=$(remote_version)
     if [ -z "$_co_want" ]; then
         set_state "error connecting"
-        [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "unreachable" ] || ulog "could not reach $UPDATE_URL"
+        # The URL, the curl exit code and what curl said. "Could not reach it"
+        # on its own has never once been enough to act on.
+        if [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" != "unreachable" ]; then
+            _co_err=$(curl -sS --max-time "$CURL_MAX" -o /dev/null \
+                        -w 'http %{http_code}' "$UPDATE_URL/VERSION" 2>&1 </dev/null)
+            ulog "could not reach $UPDATE_URL/VERSION -- $_co_err"
+        fi
         printf 'unreachable\n' > "$UPDATE_SEEN" 2>/dev/null
         return 1
     fi
