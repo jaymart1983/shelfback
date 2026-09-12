@@ -108,6 +108,12 @@ up. Retrying with jitter is the whole difference.
   under `/mnt/us`.
 - **The Kindle cannot mount network shares.** No CIFS or NFS in the kernel, no
   SMB client, no SSH server. HTTP (`curl`) or FTP are the only ways in or out.
+- **KUAL is optional, and being optional costs nothing.** KUAL reads
+  `menu.json` from each directory under `/mnt/us/extensions/`, which is already
+  where the code lives, so the extension entry is one inert file on a device
+  without KUAL. The way in that needs nothing is a *scriptlet*: a `.sh` file in
+  `documents/` whose `# Name:` header makes the library list it as a book.
+  Both run the same `launch.sh`, and neither is a fallback for the other.
 - **A shell can write a valid zip.** Stored entries, a CRC-32 taken from gzip's
   trailer, and `printf` octal escapes for the headers; the Kindle's own `unzip`
   reads the result back byte-for-byte. Used to rebuild a book's archive when a

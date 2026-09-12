@@ -35,7 +35,7 @@ file, so there is nothing to piece together.
 
 | Where | What |
 |---|---|
-| Kindle | A jailbroken Kindle with `kterm` and the `kfxdedrm` scriptlet at `/mnt/us/extensions/kfxdedrm-scriptlet`. It is launched as a [scriptlet][scriptlet] -- a `.sh` file in `documents/` with a `# Name:` header, which shows up in the library as a book you open. [KUAL][kual] works too, if you have it. |
+| Kindle | A jailbroken Kindle with `kterm` and the `kfxdedrm` scriptlet at `/mnt/us/extensions/kfxdedrm-scriptlet`. [KUAL][kual] is optional -- see [two ways in](#two-ways-in). |
 | Server | [Calibre-Web Automated][cwa] in Docker, with the **KFX Input** plugin (and **DeDRM** if you want the fallback). |
 | Server | Anything that runs cron and can `docker exec` into that container. Written on Unraid; nothing depends on Unraid itself. |
 | Calibre-Web | A user account for the Kindle with **upload**, **download** and **view** permissions. It does not need to be an admin. |
@@ -52,8 +52,7 @@ books in flight.
 kindle/deploy.sh    # copies the scripts, installs the launcher, stamps a build number
 ```
 
-The launcher lands in `documents/` as **00 KFX Sync**, which is what you open on
-the device.
+That installs both ways in, whether or not you have KUAL.
 
 Then create two files in `/mnt/us/extensions/kfx-sync/`:
 
@@ -75,15 +74,32 @@ CWA_PASS='...'
 `cwa.conf` is plain text on the Kindle's USB storage: anyone who mounts the
 Kindle can read it. Use an account that can upload books and nothing else.
 
-Optional, so the sync survives a reboot:
+Then the boot hook, which is what lets you forget about all of this: it starts
+the background sync at every framework start, so a reboot brings it back and
+you never have to open the menu to make a book arrive.
 
 ```sh
 sh /mnt/us/extensions/kfx-sync/install-boot-hook.sh
 ```
 
-Then open **KFX Sync** from the library -- or from KUAL, if you use it. The top
-right shows the build number; the first line shows whether Calibre is
-reachable.
+Then open **KFX Sync**. The top right shows the build number; the first line
+shows whether Calibre is reachable.
+
+#### Two ways in
+
+Most of the time you never open it at all -- the background sync does the work
+while you read. When you do want the menu, there are two routes, and neither
+depends on the other:
+
+- **Without KUAL:** `documents/00 KFX Sync.sh` is a [scriptlet][scriptlet] -- a
+  `.sh` file with a `# Name:` header, which the library shows as a book. Open
+  the book and it runs.
+- **With KUAL:** `menu.json` sits in the extension directory, so **KFX Sync**
+  appears in the KUAL menu with a line saying whether the sync is running and
+  which build it is.
+
+Both start the same `launch.sh`. A Kindle with no KUAL loses nothing, and
+`menu.json` is just an unread file there.
 
 ### On the server
 
@@ -162,7 +178,10 @@ hour. See [docs/design-notes.md](docs/design-notes.md).
 
 ```
 kindle/      what runs on the Kindle
-  KFX Sync.sh        the launcher, copied into documents/ as "00 KFX Sync"
+  KFX Sync.sh        the scriptlet, copied into documents/ as "00 KFX Sync"
+  menu.json          the KUAL entry, if KUAL is installed
+  launch.sh          what both of those start: opens the front end in kterm
+  kual-status.sh     the one-line status KUAL shows beside the entry
   menu.sh            the front end, and every sync step
   kfx-daemon.sh      the background process: timed syncs, jam recovery
   cwa.sh             talking to Calibre-Web: login, book list, upload

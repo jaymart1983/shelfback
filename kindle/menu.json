@@ -1,0 +1,11 @@
+{
+    "items": [
+        {
+            "name": "KFX Sync",
+            "priority": 5,
+            "action": "launch.sh",
+            "exitmenu": true,
+            "status": "kual-status.sh"
+        }
+    ]
+}
