@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09112026.2153   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09122026.0907   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -1402,8 +1402,27 @@ trap cleanup INT TERM HUP
 # Remote run/stop, which only the receiver ever offered (/control). Nothing
 # pokes this Kindle directly any more: the port-8087 listener went with
 # poke-kindle, the server job that was its only caller.
+# A command channel that works over FTP. The file sits under /mnt/us, which is
+# the only thing this device can serve, so writing one word into it from a
+# laptop is enough to ask the Kindle for a sync with no cable and no server in
+# between.
+#
+# Read once and deleted, so a command cannot repeat forever if the daemon
+# restarts. The vocabulary is deliberately small -- sync, stop syncing, clear a
+# jam, close the way in -- and anything else is dropped rather than guessed at.
+# Nothing here reboots or reformats: whoever can write this file is whoever can
+# reach the FTP port, and that is not a reason to trust them with more.
+CMDFILE=${CMDFILE:-/mnt/us/extensions/kfx-sync/command}
 poll_cmd() {
-    [ "$BACKEND" = cwa ] && return 0
+    if [ "$BACKEND" = cwa ]; then
+        [ -s "$CMDFILE" ] || return 0
+        _pc_c=$(head -1 "$CMDFILE" 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z')
+        rm -f "$CMDFILE" 2>/dev/null
+        case "$_pc_c" in
+            run|stop|restart-ui|update|remote-on|remote-off) echo "$_pc_c" ;;
+        esac
+        return 0
+    fi
     case "$(curl -sS --max-time 8 "$RECEIVER/control" 2>/dev/null)" in run) echo run ;; stop) echo stop ;; esac
 }
 
@@ -1723,13 +1742,25 @@ boot_hook_state() {
 # on /mnt/us for a while: enough to pull the log and push a test script without
 # unplugging the Kindle and mounting it.
 #
-# OFF by default, and it stops by itself. ftpd here runs as root with no
-# password -- anyone on the same network can read and write /mnt/us while it is
-# on -- so it is a development tool, not something to leave running.
+# OFF by default. ftpd here runs as root with no password -- anyone on the same
+# network can read and write /mnt/us while it is on -- so Settings says so
+# plainly and asks before starting it.
+#
+# It is a toggle: on stays on until it is turned off, because "pull the log
+# after the next jam" can mean waiting hours. The ON state is a file in
+# STATEDIR rather than a variable, for two reasons: clearing a jam restarts the
+# UI framework, which kills the menu and anything it started, and a reboot
+# should not quietly reopen the device. The daemon reads the flag and puts the
+# server back after a restart; nothing puts it back after a reboot unless the
+# flag is still there, which is the point of it being persistent and visible.
 REMOTE_PORT=${REMOTE_PORT:-2121}
-REMOTE_MINUTES=${REMOTE_MINUTES:-30}
 REMOTE_UNTIL=${REMOTE_UNTIL:-/tmp/kfx-remote.until}
 REMOTE_PIDS=${REMOTE_PIDS:-/tmp/kfx-remote.pids}
+REMOTE_FLAG=${REMOTE_FLAG:-${STATEDIR:-/var/local/kfx-state}/REMOTE_ON}
+
+remote_wanted()  { [ -f "$REMOTE_FLAG" ]; }
+remote_want_on() { mkdir -p "$(dirname "$REMOTE_FLAG")" 2>/dev/null; : > "$REMOTE_FLAG"; }
+remote_want_off(){ rm -f "$REMOTE_FLAG" 2>/dev/null; }
 
 remote_running() {
     [ -s "$REMOTE_PIDS" ] || return 1
@@ -1759,30 +1790,83 @@ remote_start() {
     fi
     sleep 1
     remote_running || { REMOTE_HOW="$REMOTE_HOW (it did not stay up)"; rm -f "$REMOTE_PIDS"; return 1; }
-    printf '%s\n' "$(( $(date +%s) + REMOTE_MINUTES * 60 ))" > "$REMOTE_UNTIL"
     return 0
 }
 
-# Called from the menu loop and from the daemon tick: turn it off when its time
-# is up, so a forgotten toggle cannot leave the device open indefinitely.
-remote_expire() {
-    [ -f "$REMOTE_UNTIL" ] || return 0
-    _re_u=$(cat "$REMOTE_UNTIL" 2>/dev/null)
-    case "$_re_u" in ''|*[!0-9]*) remote_stop; return 0 ;; esac
-    [ "$(date +%s)" -ge "$_re_u" ] && { emit "remote access: time is up, stopping"; remote_stop; }
+# From the daemon tick: if the toggle is on and the server is not up, put it
+# back. This is what survives the framework restart that clears a jam -- the
+# menu and its child processes do not.
+remote_ensure() {
+    remote_wanted || return 0
+    remote_running && return 0
+    if remote_start; then
+        emit "remote access: ftp on $(device_ip):$REMOTE_PORT via $REMOTE_HOW"
+    fi
     return 0
 }
-
+# Three states worth telling apart: off; on and serving; and wanted but not
+# serving, which is what a failed start or a lost wifi connection looks like.
 remote_text() {
     if remote_running; then
-        _rt_u=$(cat "$REMOTE_UNTIL" 2>/dev/null)
-        printf 'on until %s, ftp %s:%s' "$(fmt_clock "$_rt_u")" "$(device_ip)" "$REMOTE_PORT"
+        printf 'ON  ftp %s:%s' "$(device_ip)" "$REMOTE_PORT"
+    elif remote_wanted; then
+        printf 'ON  but not answering'
     else
         printf 'off'
     fi
 }
 
 device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
+
+# ---------------- updates ----------------
+# The update daemon is a separate process (kfx-update.sh) because the thing
+# that restarts the sync daemon must not be the sync daemon. From here we only
+# ever ask: write a request and let it work, so a slow or failing download
+# cannot hang the menu.
+UPDATER=${UPDATER:-${BASE:-/mnt/us/extensions/kfx-sync}/kfx-update.sh}
+UPDATE_REQ=${UPDATE_REQ:-/var/local/kfx-update.req}
+ULOG=${ULOG:-/mnt/us/kfx-update.log}
+
+installed_version() { cat "${BASE:-/mnt/us/extensions/kfx-sync}/VERSION" 2>/dev/null; }
+
+request_update() {
+    [ -f "$UPDATER" ] || return 1
+    mkdir -p "$(dirname "$UPDATE_REQ")" 2>/dev/null
+    : > "$UPDATE_REQ" 2>/dev/null || return 1
+    return 0
+}
+
+# Waits, because the point of the menu item is to see what happened. The
+# updater logs every step, so this watches its log rather than guessing.
+check_updates_menu() {
+    clear 2>/dev/null
+    rule; printf ' check for updates\n'; rule; echo
+    if [ ! -f "$UPDATER" ]; then
+        printf '   the updater is not installed:\n   %s\n' "$UPDATER"
+        echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
+    fi
+    printf '   installed: %s\n' "$(stat_or "$(installed_version)")"
+    _cu_mark=$(wc -l < "$ULOG" 2>/dev/null | tr -d ' ')
+    case "$_cu_mark" in ''|*[!0-9]*) _cu_mark=0 ;; esac
+    if request_update; then
+        printf '   asked the updater to check...\n\n'
+    else
+        printf '   could not reach the updater -- is it running?\n'
+        echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
+    fi
+    # Up to a minute: a check is two small downloads, an install is eight.
+    _cu_n=0
+    while [ "$_cu_n" -lt 60 ]; do
+        sleep 2; _cu_n=$((_cu_n + 2))
+        [ -f "$UPDATE_REQ" ] && continue      # not picked up yet
+        _cu_now=$(wc -l < "$ULOG" 2>/dev/null | tr -d ' ')
+        case "$_cu_now" in ''|*[!0-9]*) _cu_now=0 ;; esac
+        [ "$_cu_now" -gt "$_cu_mark" ] && break
+    done
+    tail -8 "$ULOG" 2>/dev/null | sed 's/^/   /'
+    printf '\n   installed now: %s\n' "$(stat_or "$(installed_version)")"
+    echo; printf ' [enter] > '; read _x 2>/dev/null
+}
 
 # ---------------- calibre login ----------------
 # Address, username and password live in cwa.conf beside the config. The daemon
@@ -1899,21 +1983,27 @@ settings_menu() {
             2) light_idle_next ;;
             6) calibre_login_menu ;;
             7) clear 2>/dev/null; echo
-               if remote_running; then
-                   remote_stop; printf '   remote access stopped\n'
+               if remote_wanted; then
+                   remote_want_off; remote_stop
+                   emit "remote access: turned off"
+                   printf '   remote access is off\n'
                else
-                   printf '   Starts an FTP server on this Kindle for %s minutes.\n' "$REMOTE_MINUTES"
-                   printf '   It serves /mnt/us as root with NO password: anyone on\n'
-                   printf '   this network can read and write it while it is on.\n'
-                   printf '   For pulling logs and pushing test scripts.\n\n'
-                   printf '   type YES to start it > '
+                   printf '   Puts an FTP server on this Kindle, serving /mnt/us,\n'
+                   printf '   for pulling logs and pushing test scripts.\n\n'
+                   printf '   It runs as root with NO password: anyone on this\n'
+                   printf '   network can read and write /mnt/us while it is on.\n'
+                   printf '   It stays on until you turn it off here.\n\n'
+                   printf '   type YES to turn it on > '
                    read _ra 2>/dev/null
                    if [ "$_ra" = "YES" ]; then
+                       remote_want_on
                        if remote_start; then
-                           emit "remote access: ftp on $(device_ip):$REMOTE_PORT via $REMOTE_HOW, ${REMOTE_MINUTES}min"
-                           printf '\n   started (%s): ftp://%s:%s/\n' "$REMOTE_HOW" "$(device_ip)" "$REMOTE_PORT"
+                           emit "remote access: ftp on $(device_ip):$REMOTE_PORT via $REMOTE_HOW"
+                           printf '\n   on (%s): ftp://%s:%s/\n' "$REMOTE_HOW" "$(device_ip)" "$REMOTE_PORT"
+                           printf '   it stays on, through a UI restart, until turned off\n'
                        else
                            printf '\n   could not start: %s\n' "$REMOTE_HOW"
+                           printf '   left ON, so the daemon will keep trying\n'
                        fi
                    else
                        printf '\n   cancelled\n'
@@ -1991,6 +2081,7 @@ draw() {
     printf ' 3) Books\n'
     [ "$(state_get N_PROBLEMS)" -gt 0 ] 2>/dev/null && printf ' 4) View problems\n'
     echo
+    printf ' U) Check for updates\n'
     printf ' S) Settings\n'
     printf ' R) Refresh\n'
     printf ' L) Log\n'
@@ -2374,6 +2465,11 @@ if [ "$(daemon_state)" = running ] && [ "$(state_get DAEMON_BUILD)" != "$KFX_BUI
     sh "$DAEMON" stop >/dev/null 2>&1
 fi
 sh "$DAEMON" ensure >/dev/null 2>&1
+# The update daemon too, or "Check for updates" reports it unreachable until
+# the next reboot -- the boot hook was the only thing starting it. Backgrounded
+# and ignored: it is not needed to sync books, so it must not delay the menu or
+# fail it.
+[ -f "$UPDATER" ] && ( sh "$UPDATER" start >/dev/null 2>&1 & ) 2>/dev/null
 # In the background: these need a cc.db query and a directory walk, and blocking
 # the first paint on them is what the panel's "-" was avoiding. They fill in a
 # few seconds later, on the next repaint.
@@ -2402,6 +2498,7 @@ while :; do
             2) monitor_toggle ;;
             3) books_menu ;;
             4) refresh_state full; list_problems ;;
+            u|U) check_updates_menu ;;
             s|S) settings_menu ;;
             r|R) refresh_state full ;;
             l|L) view_log ;;
@@ -2412,7 +2509,6 @@ while :; do
     else
         _idle=$((_idle + UI_STEP))
         _since=$((_since + UI_STEP))
-        remote_expire
         _li=$(light_idle)
         [ "$_li" -gt 0 ] && [ "$_idle" -ge "$_li" ] && light_off
         if [ "$_since" -ge "$REFRESH" ]; then

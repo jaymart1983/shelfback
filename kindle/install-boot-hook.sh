@@ -46,7 +46,13 @@ cat > "$HOOK" <<'HOOKEOF'
 # Must return immediately: kmc runs this synchronously before continuing.
 # setsid so the monitor is not killed when this job stops with the framework.
 echo "$(date '+%m-%d %H:%M:%S') boot hook fired" >> /mnt/us/kfx-daemon.log 2>/dev/null
-setsid sh -c 'sleep 30; /mnt/us/extensions/kfx-sync/kfx-daemon.sh ensure' >/dev/null 2>&1 &
+setsid sh -c 'sleep 30
+    /mnt/us/extensions/kfx-sync/kfx-daemon.sh ensure
+    # The updater is what makes a broken release fixable without a cable, so it
+    # has to come back on its own too. Started second and separately: if it
+    # will not start, the sync daemon is already up.
+    [ -x /mnt/us/extensions/kfx-sync/kfx-update.sh ] &&
+        /mnt/us/extensions/kfx-sync/kfx-update.sh start' >/dev/null 2>&1 &
 exit 0
 HOOKEOF
 
@@ -54,7 +60,7 @@ chmod +x "$HOOK" 2>/dev/null
 echo "installed $HOOK"
 echo
 echo "It runs at every framework start (boot, and after a UI restart)."
-echo "It waits 30s for wifi, then starts the monitor only if it is not"
-echo "already running, so it is safe to fire repeatedly."
+echo "It waits 30s for wifi, then starts the monitor and the updater, each"
+echo "only if it is not already running, so it is safe to fire repeatedly."
 echo
 echo "To undo:  sh $0 remove"

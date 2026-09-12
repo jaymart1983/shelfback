@@ -1,0 +1,12 @@
+# The files that make up a release, fetched in this order by kfx-update.sh.
+# A name here must be a plain file name: the updater refuses anything with a
+# slash, a leading dot or a space, because these names come from the network
+# and become paths on the device.
+menu.sh
+cwa.sh
+state.sh
+kfx-daemon.sh
+kfx-update.sh
+launch.sh
+kual-status.sh
+menu.json

@@ -12,9 +12,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 KINDLE=${KINDLE:-/Volumes/Kindle}
 EXT="$KINDLE/extensions/kfx-sync"
 DOCS="$KINDLE/documents"
-FILES="menu.sh cwa.sh state.sh kfx-daemon.sh launch.sh kual-status.sh"
+FILES="menu.sh cwa.sh state.sh kfx-daemon.sh kfx-update.sh launch.sh kual-status.sh"
 # menu.json is what KUAL reads, if KUAL is installed; it is inert otherwise.
-DATA="menu.json"
+# MANIFEST and VERSION are how the device knows what it is running, and are
+# what kfx-update.sh compares against GitHub.
+DATA="menu.json MANIFEST VERSION"
 # The way in without KUAL: a scriptlet in documents/, whose "# Name:" header
 # makes it appear in the library as a book you open. It only runs launch.sh.
 LAUNCHER="KFX Sync.sh"
@@ -30,13 +32,17 @@ BUILD=$(date +%m%d%Y.%H%M)
 grep -q '^KFX_BUILD=' "$HERE/menu.sh" || { echo "menu.sh has no KFX_BUILD line"; exit 1; }
 sed -i '' "s/^KFX_BUILD=.*/KFX_BUILD=$BUILD   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy/" "$HERE/menu.sh"
 sh -n "$HERE/menu.sh"
+# The same number in VERSION, so a cable install and an over-the-air install
+# produce the same identity. Committing this file is how an update is
+# published; the device compares it with its own copy and nothing else.
+printf '%s\n' "$BUILD" > "$HERE/VERSION"
 
 for f in $FILES $DATA; do
     cp "$HERE/$f" "$EXT/$f"
     cmp -s "$HERE/$f" "$EXT/$f" || { echo "copy of $f did not verify"; exit 1; }
     echo "  $f"
 done
-chmod +x "$EXT/launch.sh" "$EXT/kual-status.sh" 2>/dev/null || :
+chmod +x "$EXT/launch.sh" "$EXT/kual-status.sh" "$EXT/kfx-update.sh" 2>/dev/null || :
 # The launcher carries no build number and changes almost never, so only copy
 # it when it differs -- a needless write shows up as a "new book" on the device.
 if [ -d "$DOCS" ] && ! cmp -s "$HERE/$LAUNCHER" "$DOCS/$LAUNCHER_AS"; then

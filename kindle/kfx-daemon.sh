@@ -34,6 +34,10 @@ EVERY_SWEEP=${EVERY_SWEEP:-4}          # walk local files      ~2m
 EVERY_PURGE=${EVERY_PURGE:-10}         # delete synced books   ~5m  (~14s each)
 EVERY_LIBRARY=${EVERY_LIBRARY:-20}     # report the catalogue  ~10m
 EVERY_STATS=${EVERY_STATS:-10}         # refresh the panel counts ~5m, even idle
+# Ask the update daemon to look for new code. Only an ask: it owns the download,
+# the verify and the restart, and it is the one process a bad update cannot
+# take down with it.
+EVERY_UPDATE=${EVERY_UPDATE:-240}      # ~2h at a 30s tick
 PASS_EVERY=$TICK                       # what the menu shows
 
 # The daemon is always up; whether it syncs on a timer is a separate flag the
@@ -285,6 +289,23 @@ loop() {
             stop) dlog "remote stop"; emit "monitor stopped remotely"; flush_log
                   drop_lock; remove_book; rm -f "$PIDFILE"; exit 0 ;;
             run)  dlog "remote run: full sync"; want_full=1 ;;
+            restart-ui)
+                  # The jam recovery, asked for by hand: the only thing that
+                  # clears a wedged transfer queue.
+                  dlog "remote restart-ui"; restart_framework ;;
+            update)
+                  # Hand it to the update daemon rather than doing it here:
+                  # this process is one of the things being replaced.
+                  dlog "remote update: asking the updater to check"
+                  request_update || dlog "no updater installed" ;;
+            remote-on)
+                  dlog "remote-on: opening dev FTP"
+                  remote_want_on; remote_ensure ;;
+            remote-off)
+                  # Turn off the toggle as well, or remote_ensure puts it
+                  # straight back on the next tick.
+                  dlog "remote-off: closing the way in"
+                  remote_want_off; remote_stop ;;
         esac
 
         # Idle unless the monitor is on or something asked for a sync. Still
@@ -314,7 +335,9 @@ loop() {
             DO_CLOUD=; DO_RESEND=; DO_PURGE=; DO_SWEEP=
             drop_lock
             maybe_recover_wedge
-        remote_expire        # stop dev FTP when its time is up, menu open or not
+        remote_ensure        # put dev FTP back if the toggle is on -- the
+                             # framework restart that clears a jam kills it
+        [ "$(every "$tick" "$EVERY_UPDATE")" = 1 ] && request_update
         else
             # The menu is driving. Stay out of its way rather than racing it.
             dlog "skipped: $(lock_holder) holds the run lock"
