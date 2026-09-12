@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09122026.0943   # published over the air
+KFX_BUILD=09122026.0952   # published by publish.sh
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -1758,6 +1758,22 @@ REMOTE_UNTIL=${REMOTE_UNTIL:-/tmp/kfx-remote.until}
 REMOTE_PIDS=${REMOTE_PIDS:-/tmp/kfx-remote.pids}
 REMOTE_FLAG=${REMOTE_FLAG:-${STATEDIR:-/var/local/kfx-state}/REMOTE_ON}
 
+# tcpsvd runs one ftpd per connection, so a live ftpd that is not the
+# super-server itself IS someone connected. Counting processes rather than
+# parsing a log means the screen is right the moment a client attaches and the
+# moment it drops, with nothing to clean up afterwards.
+remote_clients() {
+    _rc_n=0
+    for _rc_d in "${PROCDIR:-/proc}"/[0-9]*; do
+        grep -qa 'ftpd' "$_rc_d/cmdline" 2>/dev/null || continue
+        # the listener's own command line names ftpd as its argument
+        grep -qa 'tcpsvd' "$_rc_d/cmdline" 2>/dev/null && continue
+        grep -qa 'inetd'  "$_rc_d/cmdline" 2>/dev/null && continue
+        _rc_n=$((_rc_n + 1))
+    done
+    printf '%s' "$_rc_n"
+}
+
 remote_wanted()  { [ -f "$REMOTE_FLAG" ]; }
 remote_want_on() { mkdir -p "$(dirname "$REMOTE_FLAG")" 2>/dev/null; : > "$REMOTE_FLAG"; }
 remote_want_off(){ rm -f "$REMOTE_FLAG" 2>/dev/null; }
@@ -1808,12 +1824,28 @@ remote_ensure() {
 # serving, which is what a failed start or a lost wifi connection looks like.
 remote_text() {
     if remote_running; then
-        printf 'ON  ftp %s:%s' "$(device_ip)" "$REMOTE_PORT"
+        _rt_c=$(remote_clients)
+        if [ "${_rt_c:-0}" -gt 0 ]; then
+            printf 'IN USE by %s' "$_rt_c"
+        else
+            printf 'on %s:%s' "$(device_ip)" "$REMOTE_PORT"
+        fi
     elif remote_wanted; then
-        printf 'ON  but not answering'
+        printf 'on, not answering'
     else
         printf 'off'
     fi
+}
+
+# One line for the panel: what the updater is doing, in a few words.
+update_panel_text() {
+    [ -f "$UPDATER" ] || { printf 'not installed'; return; }
+    _up_a=$(update_available)
+    if [ -n "$_up_a" ]; then printf '%s %s' "$_up_a" "$(update_due_text)"; return; fi
+    case "$(update_status)" in
+        'up to date'|'') printf 'up to date' ;;
+        *) printf '%s' "$(update_status)" ;;
+    esac
 }
 
 device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
@@ -2165,6 +2197,15 @@ draw() {
     two ' daemon:'   "$_dst"       'monitor:'  "$(monitor_text)"
     if monitor_on; then _nxt=$(fmt_clock "$(state_get NEXT_SYNC)"); else _nxt="--:--:--"; fi
     two ' last sync:' "$(fmt_clock "$(state_get LAST_SYNC)")" 'next sync:' "$_nxt"
+    two ' updates:'  "$(update_panel_text)" 'ftp:' "$(remote_text)"
+    # Someone reading or writing this Kindle's storage is worth more than a
+    # column: it is a server with no password, and the owner should be able to
+    # see it is in use without going looking.
+    _dr_c=$(remote_clients)
+    if remote_running && [ "${_dr_c:-0}" -gt 0 ]; then
+        printf ' >> FTP IN USE: %s connection(s) to %s:%s\n' \
+            "$_dr_c" "$(device_ip)" "$REMOTE_PORT"
+    fi
     rule
     # Books.
     two ' decrypted:' "$(stat_or "$(state_get N_SYNCED)")" \
