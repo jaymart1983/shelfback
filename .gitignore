@@ -1,0 +1,11 @@
+# Credentials and device-specific data never belong here.
+cwa.conf
+cwa.seed
+wanted-asins
+*.token
+*.key
+.env
+
+# Diagnostics pulled off the device
+captures/
+*.log

@@ -1,0 +1,36 @@
+# /mnt/us/extensions/kfx-sync/config -- sourced by menu.sh at startup.
+# Copy to "config" next to the scripts and edit. Every value here is a default
+# that the scripts already use; set one only to change it.
+
+# Where finished books go. "cwa" talks to Calibre-Web Automated directly and is
+# the only supported value; "receiver" is the retired middle service.
+BACKEND=cwa
+
+# --- what to sync ------------------------------------------------------------
+# Delete a book from the Kindle once Calibre confirms it holds it.
+#PURGE_SYNCED=1
+# Give up on a book after this many failed attempts.
+#MAX_RETRIES=3
+# Books to fetch that the Kindle's own catalogue does not list, one ASIN per
+# line, in the file below.
+#WANTED=/mnt/us/extensions/kfx-sync/wanted-asins
+
+# --- the transfer queue jam --------------------------------------------------
+# Seconds of no book data before the download counts as jammed.
+#NODATA_AFTER=60
+# Seconds frozen at the same byte count before it counts as jammed.
+#STALL_AFTER=60
+# Wait before requesting a newly seen book. Both default to none: waiting for
+# cover art prevented nothing and delayed every book. See docs/design-notes.md.
+#READY_GRACE=0
+#SETTLE_WINDOW=0
+
+# --- screen ------------------------------------------------------------------
+# Seconds before the backlight goes off while the menu is idle. 0 keeps it on.
+#LIGHT_IDLE=60
+# Seconds between status panel repaints.
+#REFRESH=60
+
+# --- Calibre-Web -------------------------------------------------------------
+# Address and login live in cwa.conf, next to this file, so they can be changed
+# from Settings -> Calibre login without editing this one. See cwa.conf.example.

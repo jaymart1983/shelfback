@@ -1,0 +1,20 @@
+# /mnt/us/extensions/kfx-sync/cwa.conf -- the Calibre-Web address and login.
+# Copy to "cwa.conf" next to the scripts and edit, or set it on the device from
+# KFX Sync -> Settings -> Calibre login, which rewrites this file.
+#
+# This is plain text on the Kindle's USB storage: anyone who mounts the Kindle
+# can read it. Use an account that can upload books and nothing else -- not an
+# administrator. In Calibre-Web: Admin -> Users -> Add, with Upload, Download
+# and View permissions.
+
+CWA_URL='http://192.168.1.10:8083'
+CWA_USER='kindle@example.net'
+CWA_PASS='change me'
+
+# How long an upload counts as done before Calibre has to confirm it. It covers
+# the import, the conversion, and backfill-asins recording the Amazon ID.
+#CWA_GRACE=1800
+
+# How long a "this book has no Amazon ID" answer is trusted before the book's
+# page is read again. A book uploaded moments ago has none yet.
+#CWA_RECHECK=600

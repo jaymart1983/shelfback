@@ -1,0 +1,114 @@
+# Design notes
+
+Things that were measured rather than assumed, including the ones that were
+wrong first. Kept because each cost hours to find, and because the obvious
+explanation was often the wrong one.
+
+## The transfer queue jams when a book is shared
+
+Sharing a book jams the Kindle's transfer queue. Afterwards every download
+stalls with only the ~8KB sidecar arriving, and cover art stops arriving too:
+covers and book content share one queue.
+
+**Only a UI framework restart clears it** (`initctl restart lab126_gui`). Ruled
+out with evidence, each leaving covers at 0/6: the download manager (`tmd`),
+the to-do queue, `whisperstore`, toggling to-do processing, and
+`archive refreshCache`. A reboot also works, but a framework restart is enough.
+
+**Cover art is a symptom, not a cause.** Two freshly shared books that already
+had covers still stalled. An earlier version waited for a cover before
+requesting a book, on the theory that requesting too early caused the jam. It
+delayed every new book by up to 30 minutes and prevented nothing -- a book that
+has not downloaded often never gets a cover, so the wait always ran out.
+
+**What works:** request immediately; treat 60 seconds with no book data as a
+jam; restart the framework; ask again. Cap the restarts per book (two) so a
+book that genuinely cannot be downloaded does not restart the UI forever.
+
+The background process must survive the restart it triggers. `setsid` is enough:
+it is reparented to init and outlives the framework. The menu, which runs inside
+`kterm`, does not -- it dies with the restart, by design.
+
+## A KFX book declares its own pieces
+
+A KFX book can span several containers. Calibre's KFX Input plugin refuses the
+book unless every container listed in its *container entity map* is present in
+one `.kfx-zip` ("Book is incomplete ... Missing containers").
+
+Measured on a real book:
+
+- every piece is a plain `CONT` container once decrypted, and its own id
+  (`CR!` + 28 characters) is the **first** such string in the file;
+- `metadata.kfx` carries the map: its own id first, then every id the book needs;
+- a single-file book has no map and mentions only its own id.
+
+So completeness is decidable on the device with `grep`: the ids any file
+mentions, minus the first id of each file present. Anything left over is
+missing, and is looked for in the book's `.sdr/assets/attachables`.
+
+The device's own packager does not always include the extra pieces, which is why
+this check exists at all.
+
+## Calibre-Web has no ASIN-keyed list
+
+`/ajax/listbooks` returns every book in one request, but its `identifiers` field
+is always empty, and neither OPDS nor the web search matches an Amazon ID. The
+only place Calibre-Web shows it is each book's own page, as an
+`amazon.com/dp/<ASIN>` link -- and only for identifiers stored as type `amazon`.
+A `kindle` or `mobi-asin` identifier is invisible.
+
+So the Kindle builds its own map: one list request for the current book ids, one
+page read per id it has not seen, and ids that leave the list drop out. An
+answer of "no ASIN" is re-checked after ten minutes, because a book uploaded
+seconds ago has not been given its identifier yet -- caching that permanently
+meant a book was never seen as confirmed and was uploaded again.
+
+**A partial list is worse than no list.** A missing book means "fetch it again",
+so if the list or any page cannot be read, the previous list stands and the pass
+fails loudly.
+
+## Calibre-Web serves a different file than it stores
+
+With `embed_metadata` on, Calibre-Web rewrites the EPUB at download time,
+stamping in the library's `cover.jpg` and metadata. Two consequences:
+
+- changing only a cover changes what readers receive, so a cover fix should also
+  touch the book's `last_modified`, or no reader will notice;
+- the KOReader checksums Calibre-Web stores are of the **served** file, so
+  hashing the stored EPUB and finding no match is normal, not damage.
+
+## Progressive JPEGs render at 1/8 size
+
+The reader's JPEG decoder reads only the DC coefficients of a progressive JPEG,
+so a 1600x2400 cover arrives as roughly 200x300 and is upscaled into blocks.
+Amazon's full-size cover art is progressive.
+
+`jpegtran` transcodes the existing coefficients, so the pixels do not change --
+but this build **keeps** progressive mode unless it is given a scan script with
+a single interleaved scan (`0 1 2: 0 63 0 0;`). Every image is verified by
+decoding both versions and comparing; anything that does not come out identical
+is left alone.
+
+## Amazon rate-limits, it does not block
+
+Calibre's Amazon metadata source reports "Found 0 results" for ASINs that
+clearly exist. Measured: roughly one request in four returns the real page
+(~200KB); the rest are a 3.7KB bot-block page. The plugin tries once and gives
+up. Retrying with jitter is the whole difference.
+
+## Small things that cost time
+
+- **Identify books by ASIN, never by title.** Title matching silently attached
+  one book's cover and identifiers to another; two different series brandings of
+  the same work defeat any similarity test.
+- **Kindle shell:** busybox `grep` skips binary files unless given `-a`;
+  `[ -w ]` returns true for root even on a read-only mount (test by writing);
+  `date +%H` yields values like `09`, which arithmetic reads as octal.
+- **`/tmp` is a 64MB tmpfs** shared with `/var`. Anything book-sized belongs
+  under `/mnt/us`.
+- **The Kindle cannot mount network shares.** No CIFS or NFS in the kernel, no
+  SMB client, no SSH server. HTTP (`curl`) or FTP are the only ways in or out.
+- **A shell can write a valid zip.** Stored entries, a CRC-32 taken from gzip's
+  trailer, and `printf` octal escapes for the headers; the Kindle's own `unzip`
+  reads the result back byte-for-byte. Used to rebuild a book's archive when a
+  piece arrives late.
