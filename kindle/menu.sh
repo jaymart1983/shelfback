@@ -1802,7 +1802,7 @@ fw_is_open() {   # $1 = port
 # directory. On by default; a flag in config turns it off. The firewall opens
 # with it. This is how logs (including dropbear.log) are read off the device
 # without a USB cable.
-LOG_PORT=${LOG_PORT:-2121}
+LOG_PORT=${LOG_PORT:-8080}
 LOG_PIDS=${LOG_PIDS:-/tmp/kfx-logsrv.pids}
 LOG_OFF=${LOG_OFF:-${STATEDIR:-/var/local/kfx-state}/LOGSERVER_OFF}
 LOGSERVER=${LOGSERVER:-$(dirname "$CONF")/serve-logs.sh}
@@ -1810,6 +1810,8 @@ LOGSERVER=${LOGSERVER:-$(dirname "$CONF")/serve-logs.sh}
 logsrv_running() { server_up "$LOG_PORT" "$LOG_PIDS"; }
 logsrv_ours()    { pids_alive "$LOG_PIDS"; }
 logsrv_wanted()  { [ ! -f "$LOG_OFF" ]; }
+logsrv_want_on() { rm -f "$LOG_OFF" 2>/dev/null; }
+logsrv_want_off(){ mkdir -p "$(dirname "$LOG_OFF")" 2>/dev/null; : > "$LOG_OFF"; }
 logsrv_stop() {
     [ -s "$LOG_PIDS" ] && while read -r _lp; do kill "$_lp" 2>/dev/null; done < "$LOG_PIDS"
     rm -f "$LOG_PIDS"
@@ -1841,7 +1843,7 @@ logsrv_ensure() {
 logsrv_text() {
     if logsrv_running; then
         if ! logsrv_ours; then printf 'busy'
-        else fw_is_open "$LOG_PORT"; [ "$?" = 1 ] && printf 'on, blocked' || printf 'http :%s' "$LOG_PORT"; fi
+        else fw_is_open "$LOG_PORT"; [ "$?" = 1 ] && printf 'blocked' || printf 'on'; fi
     elif logsrv_wanted; then printf 'starting'
     else printf 'off'
     fi
@@ -2204,8 +2206,8 @@ enroll_window() {
 ssh_text() {
     if ssh_running; then
         if ! ssh_ours; then printf 'busy'
-        else fw_is_open "$SSH_PORT"; [ "$?" = 1 ] && printf 'on, blocked' || printf 'on :%s' "$SSH_PORT"; fi
-    elif ssh_wanted; then printf 'on, not answering'
+        else fw_is_open "$SSH_PORT"; [ "$?" = 1 ] && printf 'blocked' || printf 'on'; fi
+    elif ssh_wanted; then printf 'starting'
     else printf 'off'
     fi
 }
@@ -2496,7 +2498,8 @@ settings_menu() {
         printf '   6) Calibre login\n'
         printf '   7) SSH (%s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo On || echo Off)"
         printf '   8) Enrol an SSH key over the network\n'
-        printf '   9) Automatic updates: %s\n' "$(auto_update_wanted && echo ON || echo off)"
+        printf '   9) Automatic updates: %s\n' "$(auto_update_wanted && echo On || echo Off)"
+        printf '  10) HTTP Log (%s): %s\n' "$LOG_PORT" "$(logsrv_wanted && echo On || echo Off)"
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -2578,6 +2581,19 @@ settings_menu() {
                     printf '   appears. It never installs an older one.\n'
                 fi
                 echo; printf ' [enter] > '; read _x 2>/dev/null ;;
+            10) clear 2>/dev/null; echo
+                if logsrv_wanted; then
+                    logsrv_want_off; logsrv_stop
+                    printf '   HTTP log server is off.\n'
+                else
+                    logsrv_want_on
+                    if logsrv_ensure; then
+                        printf '   HTTP log server on: http://%s:%s/\n' "$(device_ip)" "$LOG_PORT"
+                    else
+                        printf '   left on; the daemon will keep trying to start it\n'
+                    fi
+                fi
+                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
             3) clear 2>/dev/null
                tail -30 /mnt/us/kfx-daemon.log 2>/dev/null | sed 's/^/  /' || echo "  no log yet"
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
@@ -2635,8 +2651,8 @@ draw() {
     # Updates gets the full width: "update available (09122026.1100) in 5m" is
     # longer than half a screen. The address shares its row with SSH state.
     two ' updates:'  "$(update_panel_text)" '' ''
-    two ' ip:'       "$(stat_or "$(device_ip)")" 'ssh:' "$(ssh_text)"
-    two ' logs:'     "$(logsrv_text)" '' ''
+    two ' ip:' "$(stat_or "$(device_ip)")" "ssh ($SSH_PORT):" "$(ssh_text)"
+    two " logs ($LOG_PORT):" "$(logsrv_text)" '' ''
     rule
     # Books.
     two ' decrypted:' "$(stat_or "$(state_get N_SYNCED)")" \
