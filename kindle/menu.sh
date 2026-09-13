@@ -1805,7 +1805,7 @@ fw_is_open() {   # $1 = port
 # replace our own line (never touch root), validate the result parses and still
 # has root, and restore the backups if anything looks wrong. The rootfs is put
 # back read-only at the end whatever happens.
-FTP_USER=${FTP_USER:-kfx}
+SSH_USER=${SSH_USER:-kfx}
 PASSWD_FILE=${PASSWD_FILE:-/etc/passwd}
 SHADOW_FILE=${SHADOW_FILE:-/etc/shadow}
 ACCT_BACKUP=${ACCT_BACKUP:-$LOGDIR/etc-backup}
@@ -1827,8 +1827,8 @@ hash_password() {   # $1 = plaintext
     return 1
 }
 
-acct_exists() { cut -d: -f1 "$PASSWD_FILE" 2>/dev/null | grep -qx "$FTP_USER"; }
-acct_home()   { awk -F: -v u="$FTP_USER" '$1==u{print $6; exit}' "$PASSWD_FILE" 2>/dev/null; }
+acct_exists() { cut -d: -f1 "$PASSWD_FILE" 2>/dev/null | grep -qx "$SSH_USER"; }
+acct_home()   { awk -F: -v u="$SSH_USER" '$1==u{print $6; exit}' "$PASSWD_FILE" 2>/dev/null; }
 
 # The account exists only so dropbear will accept a key login as it; nothing
 # reads its password. So the script makes it itself -- a random password, no
@@ -1839,12 +1839,12 @@ ensure_ssh_account() {
     if acct_exists && [ "$(acct_home)" = "$SSH_HOME" ]; then return 0; fi
     _ea_pw=$(head -c 18 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d " \n")
     [ -n "$_ea_pw" ] || _ea_pw="kfx$(date +%s)$$"      # fallback; never used anyway
-    create_ftp_user "$_ea_pw"
+    create_account "$_ea_pw"
 }
 
 # Returns: 0 made/updated, 1 could not hash, 2 rootfs not writable, 3 validation
 # failed (and was rolled back).
-create_ftp_user() {   # $1 = plaintext password
+create_account() {   # $1 = plaintext password
     _cu_hash=$(hash_password "$1")
     [ -n "$_cu_hash" ] || return 1
 
@@ -1866,20 +1866,20 @@ create_ftp_user() {   # $1 = plaintext password
 
     # Build both files without our old line, then append the new one. Editing
     # in a temp and moving means a half-written file is never the live one.
-    grep -v "^$FTP_USER:" "$PASSWD_FILE" > "$PASSWD_FILE.new.$$" 2>/dev/null
+    grep -v "^$SSH_USER:" "$PASSWD_FILE" > "$PASSWD_FILE.new.$$" 2>/dev/null
     # /bin/sh, not /bin/false: this account is for SSH dev access too, which
     # needs a shell. Home is on ext3 (real perms) so dropbear will trust its
     # authorized_keys; FTP still serves /mnt/us via -w regardless.
     mkdir -p /var/local/kfx 2>/dev/null; chmod 755 /var/local/kfx 2>/dev/null
-    printf '%s:x:%s:%s:kfx dev:/var/local/kfx:/bin/sh\n' "$FTP_USER" "$_cu_uid" "$_cu_uid" >> "$PASSWD_FILE.new.$$"
-    grep -v "^$FTP_USER:" "$SHADOW_FILE" > "$SHADOW_FILE.new.$$" 2>/dev/null
-    printf '%s:%s:19000:0:99999:7:::\n' "$FTP_USER" "$_cu_hash" >> "$SHADOW_FILE.new.$$"
+    printf '%s:x:%s:%s:shelfback:/var/local/kfx:/bin/sh\n' "$SSH_USER" "$_cu_uid" "$_cu_uid" >> "$PASSWD_FILE.new.$$"
+    grep -v "^$SSH_USER:" "$SHADOW_FILE" > "$SHADOW_FILE.new.$$" 2>/dev/null
+    printf '%s:%s:19000:0:99999:7:::\n' "$SSH_USER" "$_cu_hash" >> "$SHADOW_FILE.new.$$"
 
     # Validate before committing: every passwd line has 7 fields, root is still
     # there, and our user is present exactly once.
     if ! awk -F: 'NF!=7{bad=1} END{exit bad}' "$PASSWD_FILE.new.$$" 2>/dev/null \
        || ! grep -q '^root:' "$PASSWD_FILE.new.$$" \
-       || [ "$(grep -c "^$FTP_USER:" "$PASSWD_FILE.new.$$")" != 1 ] \
+       || [ "$(grep -c "^$SSH_USER:" "$PASSWD_FILE.new.$$")" != 1 ] \
        || ! grep -q '^root:' "$SHADOW_FILE.new.$$"; then
         rm -f "$PASSWD_FILE.new.$$" "$SHADOW_FILE.new.$$"
         $REMOUNT_RO 2>/dev/null
@@ -1911,7 +1911,7 @@ SSH_FLAG=${SSH_FLAG:-${STATEDIR:-/var/local/kfx-state}/SSH_ON}
 SSH_PID=${SSH_PID:-/tmp/kfx-dropbear.pid}
 # On ext3, NOT /mnt/us: /mnt/us is FAT, and dropbear refuses an
 # authorized_keys whose ownership/permissions it cannot trust -- which FAT
-# cannot express. The account home moves here too (create_ftp_user), so
+# cannot express. The account home moves here too (create_account), so
 # dropbear reads ~/.ssh/authorized_keys from a real filesystem. FTP is
 # unaffected: the dev server serves /mnt/us via -w regardless of home.
 SSH_HOME=${SSH_HOME:-/var/local/kfx}
@@ -2020,7 +2020,7 @@ ssh_ensure() {
         if ssh_ours; then fw_is_open "$SSH_PORT"; [ "$?" = 1 ] && fw_open "$SSH_PORT"; fi
         return 0
     fi
-    if ssh_start; then emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $FTP_USER)"; fi
+    if ssh_start; then emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $SSH_USER)"; fi
     return 0
 }
 
@@ -2131,7 +2131,7 @@ enroll_window() {
         printf '   could not open the endpoint: %s\n' "$ENROLL_HOW"
         echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
     fi
-    acct_exists || printf '   NOTE: no dev account yet -- create it (option 8) or\n   the enrolled key cannot be used until you do.\n\n'
+    ensure_ssh_account >/dev/null 2>&1   # the account must exist for a key to be usable
     printf '   On the host you want to let in, run:\n'
     printf '     curl --max-time 130 --data-binary @~/.ssh/id_ed25519.pub \\\n'
     printf '       http://%s:%s/enroll\n\n' "$(device_ip)" "$ENROLL_PORT"
@@ -2442,7 +2442,7 @@ settings_menu() {
         printf '   4) Recovery history\n'
         printf '   5) Restart UI now (clears stuck downloads)\n'
         printf '   6) Calibre login\n'
-        printf '   7) SSH (dev, port %s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo ON || echo off)"
+        printf '   7) SSH (%s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo On || echo Off)"
         printf '   8) Enrol an SSH key over the network\n'
         printf '   9) Automatic updates: %s\n' "$(auto_update_wanted && echo ON || echo off)"
         printf '   [enter] back\n'
@@ -2490,15 +2490,15 @@ settings_menu() {
                        printf '    - append it to %s\n' "$SSH_AUTHKEYS"
                    else
                        printf '   Starts dropbear on port %s, key-only, no root.\n' "$SSH_PORT"
-                       printf '   Log in: ssh -p %s %s@%s\n\n' "$SSH_PORT" "$FTP_USER" "$(device_ip)"
+                       printf '   Log in: ssh -p %s %s@%s\n\n' "$SSH_PORT" "$SSH_USER" "$(device_ip)"
                        printf '   %s authorized key(s).\n' "$(ssh_keys)"
                        printf '   turn it on? [y] > '
                        read _ss 2>/dev/null
                        if [ "$_ss" = y ] || [ "$_ss" = Y ]; then
                            ssh_want_on
                            if ssh_start; then
-                               emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $FTP_USER)"
-                               printf '\n   on: ssh -p %s %s@%s\n' "$SSH_PORT" "$FTP_USER" "$(device_ip)"
+                               emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $SSH_USER)"
+                               printf '\n   on: ssh -p %s %s@%s\n' "$SSH_PORT" "$SSH_USER" "$(device_ip)"
                                printf '   host %s\n' "$(ssh_fingerprint)"
                                printf '   stays on, through a UI restart, until turned off\n'
                            else
