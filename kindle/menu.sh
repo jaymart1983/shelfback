@@ -2012,6 +2012,19 @@ hash_password() {   # $1 = plaintext
 }
 
 acct_exists() { cut -d: -f1 "$PASSWD_FILE" 2>/dev/null | grep -qx "$FTP_USER"; }
+acct_home()   { awk -F: -v u="$FTP_USER" '$1==u{print $6; exit}' "$PASSWD_FILE" 2>/dev/null; }
+
+# The account exists only so dropbear will accept a key login as it; nothing
+# reads its password. So the script makes it itself -- a random password, no
+# prompt -- the first time SSH starts, and re-makes it only if it is missing
+# or has the wrong home (e.g. a firmware update wiped /etc, or it predates
+# the move to /var/local). Idempotent once it is right.
+ensure_ssh_account() {
+    if acct_exists && [ "$(acct_home)" = "$SSH_HOME" ]; then return 0; fi
+    _ea_pw=$(head -c 18 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d " \n")
+    [ -n "$_ea_pw" ] || _ea_pw="kfx$(date +%s)$$"      # fallback; never used anyway
+    create_ftp_user "$_ea_pw"
+}
 
 # Returns: 0 made/updated, 1 could not hash, 2 rootfs not writable, 3 validation
 # failed (and was rolled back).
@@ -2161,7 +2174,7 @@ ssh_start() {
     _hb=$(ssh_bin)
     [ -f "$_hb" ] || { SSH_HOW="no dropbear binary (need $(basename "$_hb"))"; return 1; }
     chmod +x "$_hb" 2>/dev/null
-    acct_exists || { SSH_HOW="no login account -- create it in Settings first"; return 1; }
+    ensure_ssh_account || { SSH_HOW="could not create the dev account (system not writable?)"; return 1; }
     ssh_ensure_hostkey || { SSH_HOW="could not generate a host key"; return 1; }
 mkdir -p "$SSH_HOME" "$SSH_DIR" 2>/dev/null
     ssh_migrate_keys
@@ -2700,11 +2713,10 @@ settings_menu() {
                elif ! ssh_have_bin; then
                    printf '   The dropbear binary is not installed:\n'
                    printf '   %s\n' "$(ssh_bin)"
-               elif ! acct_exists; then
-                   printf '   No dev account yet. Create one with option 8,\n'
-                   printf '   then turn on SSH.\n'
                else
-                   # Bring over any key enrolled before the ext3 move, first.
+                   # The dev account is created automatically when SSH starts;
+                   # no separate step. Bring over any key enrolled before the
+                   # ext3 move first.
                    ssh_migrate_keys
                    # A key is required -- this is key-only auth. Import one from
                    # the drop file if the user left it there over FTP/USB.
