@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09132026.0854   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09132026.1311   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -2038,9 +2038,11 @@ create_ftp_user() {   # $1 = plaintext password
     # Build both files without our old line, then append the new one. Editing
     # in a temp and moving means a half-written file is never the live one.
     grep -v "^$FTP_USER:" "$PASSWD_FILE" > "$PASSWD_FILE.new.$$" 2>/dev/null
-    # /bin/sh, not /bin/false: this account is used for SSH dev access too,
-    # which needs a shell. FTP does not care either way.
-    printf '%s:x:%s:%s:kfx dev:/mnt/us:/bin/sh\n' "$FTP_USER" "$_cu_uid" "$_cu_uid" >> "$PASSWD_FILE.new.$$"
+    # /bin/sh, not /bin/false: this account is for SSH dev access too, which
+    # needs a shell. Home is on ext3 (real perms) so dropbear will trust its
+    # authorized_keys; FTP still serves /mnt/us via -w regardless.
+    mkdir -p /var/local/kfx 2>/dev/null; chmod 755 /var/local/kfx 2>/dev/null
+    printf '%s:x:%s:%s:kfx dev:/var/local/kfx:/bin/sh\n' "$FTP_USER" "$_cu_uid" "$_cu_uid" >> "$PASSWD_FILE.new.$$"
     grep -v "^$FTP_USER:" "$SHADOW_FILE" > "$SHADOW_FILE.new.$$" 2>/dev/null
     printf '%s:%s:19000:0:99999:7:::\n' "$FTP_USER" "$_cu_hash" >> "$SHADOW_FILE.new.$$"
 
@@ -2078,7 +2080,13 @@ create_ftp_user() {   # $1 = plaintext password
 SSH_PORT=${SSH_PORT:-2222}
 SSH_FLAG=${SSH_FLAG:-${STATEDIR:-/var/local/kfx-state}/SSH_ON}
 SSH_PID=${SSH_PID:-/tmp/kfx-dropbear.pid}
-SSH_DIR=${SSH_DIR:-/mnt/us/.ssh}
+# On ext3, NOT /mnt/us: /mnt/us is FAT, and dropbear refuses an
+# authorized_keys whose ownership/permissions it cannot trust -- which FAT
+# cannot express. The account home moves here too (create_ftp_user), so
+# dropbear reads ~/.ssh/authorized_keys from a real filesystem. FTP is
+# unaffected: the dev server serves /mnt/us via -w regardless of home.
+SSH_HOME=${SSH_HOME:-/var/local/kfx}
+SSH_DIR=${SSH_DIR:-$SSH_HOME/.ssh}
 SSH_AUTHKEYS=${SSH_AUTHKEYS:-$SSH_DIR/authorized_keys}
 SSH_HOSTKEY=${SSH_HOSTKEY:-${STATEDIR:-/var/local/kfx-state}/dropbear_ed25519_host_key}
 
@@ -2103,6 +2111,16 @@ ssh_want_on() { mkdir -p "$(dirname "$SSH_FLAG")" 2>/dev/null; : > "$SSH_FLAG"; 
 ssh_want_off(){ rm -f "$SSH_FLAG" 2>/dev/null; }
 ssh_ours()    { pids_alive "$SSH_PID"; }
 ssh_keys()    { grep -cE '^(ssh-|ecdsa-|sk-)' "$SSH_AUTHKEYS" 2>/dev/null || echo 0; }
+# Keys enrolled before the ext3 move landed on FAT (/mnt/us/.ssh). Bring
+# them to the real-fs location dropbear will actually trust. Idempotent.
+ssh_migrate_keys() {
+    [ -s "$SSH_AUTHKEYS" ] && return 0
+    [ -s /mnt/us/.ssh/authorized_keys ] || return 0
+    mkdir -p "$SSH_HOME" "$SSH_DIR" 2>/dev/null
+    cat /mnt/us/.ssh/authorized_keys >> "$SSH_AUTHKEYS" 2>/dev/null
+    chmod 755 "$SSH_HOME" 2>/dev/null; chmod 700 "$SSH_DIR" 2>/dev/null; chmod 600 "$SSH_AUTHKEYS" 2>/dev/null
+    return 0
+}
 
 # Make the host key once, with our own dropbearkey (the multi-binary). It lives
 # in STATEDIR so it is stable across restarts -- a changing host key would make
@@ -2145,11 +2163,19 @@ ssh_start() {
     chmod +x "$_hb" 2>/dev/null
     acct_exists || { SSH_HOW="no login account -- create it in Settings first"; return 1; }
     ssh_ensure_hostkey || { SSH_HOW="could not generate a host key"; return 1; }
-    mkdir -p "$SSH_DIR" 2>/dev/null
+mkdir -p "$SSH_HOME" "$SSH_DIR" 2>/dev/null
+    ssh_migrate_keys
     [ -f "$SSH_AUTHKEYS" ] || : > "$SSH_AUTHKEYS"
+    # dropbear insists the chain is not writable by group/other and owned by the
+    # user or root. On ext3 (unlike FAT) these actually mean something.
+    chmod 755 "$SSH_HOME" 2>/dev/null
     chmod 700 "$SSH_DIR" 2>/dev/null; chmod 600 "$SSH_AUTHKEYS" 2>/dev/null
     rm -f "$SSH_PID"
-    setsid "$_hb" dropbear -s -w -r "$SSH_HOSTKEY" -p "$SSH_PORT" -P "$SSH_PID" >/dev/null 2>&1 &
+    # -F -E: foreground so setsid keeps it, log to a file we can read (over USB
+    # or the HTTP log server) instead of the void -- so an auth rejection
+    # says why. The log lives in LOGDIR with the rest.
+    setsid "$_hb" dropbear -s -w -E -F -r "$SSH_HOSTKEY" -p "$SSH_PORT" -P "$SSH_PID" \
+        >>"${LOGDIR:-/mnt/us/kfx-logs}/dropbear.log" 2>&1 &
     sleep 2
     if ssh_running; then
         fw_open "$SSH_PORT" || SSH_HOW="running but firewall not opened"
@@ -2664,6 +2690,8 @@ settings_menu() {
                    printf '   No dev account yet. Create one with option 8,\n'
                    printf '   then turn on SSH.\n'
                else
+                   # Bring over any key enrolled before the ext3 move, first.
+                   ssh_migrate_keys
                    # A key is required -- this is key-only auth. Import one from
                    # the drop file if the user left it there over FTP/USB.
                    if [ "$(ssh_keys)" -eq 0 ] && [ -s /mnt/us/import_key.pub ]; then

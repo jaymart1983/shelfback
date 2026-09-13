@@ -42,6 +42,31 @@ ulog() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$ULOG" 2>/dev/nul
 say()  { printf '%s\n' "$*"; ulog "$*"; }
 
 local_version()  { cat "$BASE/VERSION" 2>/dev/null; }
+
+# Build stamps are mmddyyyy.hhmm, which does NOT sort chronologically as text
+# (month leads). Convert to yyyymmddhhmm so newer really is greater, and only
+# ever treat a remote build as an update when it is NEWER -- never install an
+# older one. A USB-deployed dev build can sit ahead of what is published, and
+# offering to "update" the device back to the older published build (then losing
+# whatever the dev build fixed) is exactly the trap this avoids.
+version_key() {   # $1 = mmddyyyy.hhmm -> yyyymmddhhmm (digits only), or empty
+    case "$1" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].[0-9][0-9][0-9][0-9])
+            _vk_mm=$(printf '%s' "$1" | cut -c1-2)
+            _vk_dd=$(printf '%s' "$1" | cut -c3-4)
+            _vk_yy=$(printf '%s' "$1" | cut -c5-8)
+            _vk_hm=$(printf '%s' "$1" | cut -c10-13)
+            printf '%s%s%s%s' "$_vk_yy" "$_vk_mm" "$_vk_dd" "$_vk_hm" ;;
+        *) printf '' ;;
+    esac
+}
+# true if $1 is strictly newer than $2
+version_newer() {
+    _vn_a=$(version_key "$1"); _vn_b=$(version_key "$2")
+    [ -n "$_vn_a" ] || return 1          # unparseable remote: not an update
+    [ -n "$_vn_b" ] || return 0          # unparseable local: take the remote
+    [ "$_vn_a" -gt "$_vn_b" ] 2>/dev/null
+}
 remote_version() {
     curl -sS --max-time "$CURL_MAX" "$UPDATE_URL/VERSION" 2>/dev/null </dev/null \
         | head -1 | tr -d '\r\n '
@@ -242,11 +267,13 @@ check_once() {
         *[!0-9.]*|'') say "refusing a version that is not a build stamp: $_co_want"
                       set_state "error: bad version published"; return 1 ;;
     esac
-    if [ "$_co_want" = "$_co_have" ]; then
+    # Only a NEWER remote is an update. Same or older -> nothing to do; never
+    # offer a downgrade.
+    if ! version_newer "$_co_want" "$_co_have"; then
         forget_update
         set_state "up to date (connected)"
-        [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "$_co_want" ] || ulog "up to date ($_co_have)"
-        printf '%s\n' "$_co_want" > "$UPDATE_SEEN" 2>/dev/null
+        [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "$_co_have" ] || ulog "up to date ($_co_have)"
+        printf '%s\n' "$_co_have" > "$UPDATE_SEEN" 2>/dev/null
         return 0
     fi
     [ "$(cat "$UPDATE_SEEN" 2>/dev/null)" = "$_co_want" ] || say "update available: $_co_have -> $_co_want"
