@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09132026.1418   # published by publish.sh
+KFX_BUILD=09132026.1511   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -2002,6 +2002,7 @@ ssh_migrate_keys() {
     mkdir -p "$SSH_HOME" "$SSH_DIR" 2>/dev/null
     cat /mnt/us/.ssh/authorized_keys >> "$SSH_AUTHKEYS" 2>/dev/null
     chmod 755 "$SSH_HOME" 2>/dev/null; chmod 700 "$SSH_DIR" 2>/dev/null; chmod 600 "$SSH_AUTHKEYS" 2>/dev/null
+    chown -R "$SSH_USER" "$SSH_HOME" 2>/dev/null   # user-owned: no ambiguity for dropbear
     return 0
 }
 
@@ -2053,6 +2054,7 @@ mkdir -p "$SSH_HOME" "$SSH_DIR" 2>/dev/null
     # user or root. On ext3 (unlike FAT) these actually mean something.
     chmod 755 "$SSH_HOME" 2>/dev/null
     chmod 700 "$SSH_DIR" 2>/dev/null; chmod 600 "$SSH_AUTHKEYS" 2>/dev/null
+    chown -R "$SSH_USER" "$SSH_HOME" 2>/dev/null   # user-owned: no ambiguity for dropbear
     rm -f "$SSH_PID"
     # -F -E: foreground so setsid keeps it, log to a file we can read (over USB
     # or the HTTP log server) instead of the void -- so an auth rejection
