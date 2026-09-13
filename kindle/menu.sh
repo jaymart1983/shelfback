@@ -2114,6 +2114,42 @@ ENROLL_PORT=${ENROLL_PORT:-2223}
 ENROLL_DIR=${ENROLL_DIR:-/tmp/kfx-enroll}
 ENROLL_PIDS=${ENROLL_PIDS:-/tmp/kfx-enroll.pids}
 ENROLL_SERVE=${ENROLL_SERVE:-$(dirname "$CONF")/enroll-serve.sh}
+# The registry of what has been enrolled (name / when / fingerprint), so the
+# owner can see later what was let in and revoke it.
+ENROLL_REG=${ENROLL_REG:-${STATEDIR:-/var/local/kfx-state}/enrolled}
+
+# Record an enrolment.
+enroll_register() {   # $1 name  $2 ip  $3 full public key line
+    mkdir -p "$STATEDIR" 2>/dev/null
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(date '+%Y-%m-%d %H:%M' 2>/dev/null)" "$1" "${2:-?}" "$(pubkey_fp "$3")" \
+        >> "$ENROLL_REG" 2>/dev/null
+}
+
+# Authorise an approved public key. No private key is ever minted or moved: the
+# requester generates its own keypair (in the browser, or with ssh-keygen) and
+# only the PUBLIC half reaches us -- so nothing secret crosses the plain-HTTP
+# wire, and the KDF weakness of the device's old openssl stops mattering. The
+# physical y is the authorisation; the fingerprint the owner compares against
+# the requester's screen is the guard against a key swapped in transit.
+enroll_approve() {   # $1 id  $2 name  $3 ip  $4 full public key line
+    _ea_id=$1; _ea_name=$2; _ea_ip=$3; _ea_key=$4
+    ensure_ssh_account >/dev/null 2>&1
+    # tag the authorized_keys line with the enrolled name so the file is legible
+    _ea_type=$(printf '%s' "$_ea_key" | awk '{print $1}')
+    _ea_body=$(printf '%s' "$_ea_key" | awk '{print $2}')
+    _ea_cmt=$(printf '%s' "$_ea_name" | tr ' ' '_' | sed 's/[^A-Za-z0-9._-]//g')
+    if ! ssh_add_key "$_ea_type $_ea_body kfx-$_ea_cmt"; then
+        echo deny > "$ENROLL_DIR/decision/$_ea_id"
+        printf '   could not authorise the key%s\n' "$([ -n "$SSH_KEY_ERR" ] && printf ' (%s)' "$SSH_KEY_ERR")"
+        return 1
+    fi
+    chown -R "$SSH_USER" "$SSH_HOME" 2>/dev/null   # dropbear rejects a root-owned authorized_keys
+    echo approve > "$ENROLL_DIR/decision/$_ea_id"
+    enroll_register "$_ea_name" "$_ea_ip" "$_ea_type $_ea_body kfx-$_ea_cmt"
+    printf '   enrolled "%s". %s key(s) now authorised.\n' "$_ea_name" "$(ssh_keys)"
+    return 0
+}
 
 # The SHA256 fingerprint of an offered public key, in ssh's own format when
 # openssl is here, else a plain hash so there is still something to eyeball.
@@ -2149,29 +2185,37 @@ enroll_start() {
 }
 
 # Handle any requests waiting in the spool: show each, ask, act. Returns the
-# number handled. Kept separate so it can be tested without the read loop.
+# Handle any offered keys waiting in the spool: show name, host, and the key's
+# fingerprint; on a y, authorise it. The fingerprint is here so the owner can
+# check it against the one on the requester's screen before letting them in.
+# Returns the number handled. Kept separate so it can be tested without the loop.
 enroll_process_pending() {
     _epp_n=0
     for _epp_f in "$ENROLL_DIR"/pending/*; do
         [ -f "$_epp_f" ] || continue
         _epp_id=$(basename "$_epp_f")
+        _epp_name=$(sed -n 's/^name=//p' "$_epp_f" | head -1)
         _epp_ip=$(sed -n 's/^ip=//p' "$_epp_f" | head -1)
         _epp_key=$(sed -n 's/^key=//p' "$_epp_f" | head -1)
         echo
-        printf '   a host wants to enrol an SSH key:\n'
+        printf '   enrol "%s"?\n' "${_epp_name:-?}"
         printf '     from: %s\n' "${_epp_ip:-unknown}"
         printf '     type: %s\n' "$(printf '%s' "$_epp_key" | awk '{print $1}')"
-        printf '     note: %s\n' "$(printf '%s' "$_epp_key" | awk '{print $3}')"
         printf '     %s\n' "$(pubkey_fp "$_epp_key")"
-        printf '   approve this key? [y] > '
-        read _epp_ans 2>/dev/null
-        if { [ "$_epp_ans" = y ] || [ "$_epp_ans" = Y ]; } && ssh_add_key "$_epp_key"; then
-            echo approve > "$ENROLL_DIR/decision/$_epp_id"
-            printf '   enrolled. %s key(s) now.\n' "$(ssh_keys)"
-        else
-            echo deny > "$ENROLL_DIR/decision/$_epp_id"
-            printf '   denied%s\n' "$([ -n "$SSH_KEY_ERR" ] && printf ' (%s)' "$SSH_KEY_ERR")"
-        fi
+        # Insist on y or n and re-ask on anything else -- on this keyboard a
+        # stray key is easy, and it should not silently deny (or allow).
+        _epp_done=
+        while [ -z "$_epp_done" ]; do
+            printf '   fingerprint must match their screen. [y] allow  [n] deny > '
+            if ! read _epp_ans 2>/dev/null; then
+                echo deny > "$ENROLL_DIR/decision/$_epp_id"; printf '   denied.\n'; _epp_done=1; break
+            fi
+            case "$_epp_ans" in
+                y|Y) enroll_approve "$_epp_id" "$_epp_name" "$_epp_ip" "$_epp_key"; _epp_done=1 ;;
+                n|N) echo deny > "$ENROLL_DIR/decision/$_epp_id"; printf '   denied.\n'; _epp_done=1 ;;
+                *)   printf '   please press y or n.\n' ;;
+            esac
+        done
         # Remove the request now so a refresh cannot re-prompt it before the
         # handler (which is reading the decision) clears it.
         rm -f "$_epp_f"
@@ -2183,19 +2227,25 @@ enroll_process_pending() {
 enroll_window() {
     clear 2>/dev/null
     rule; printf ' enrol an SSH key\n'; rule; echo
+    if ! ssh_have_bin; then
+        printf '   the SSH binary is not installed yet.\n'
+        echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
+    fi
     if ! enroll_start; then
         printf '   could not open the endpoint: %s\n' "$ENROLL_HOW"
         echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
     fi
     ensure_ssh_account >/dev/null 2>&1   # the account must exist for a key to be usable
-    printf '   On the host you want to let in, run:\n'
-    printf '     curl --max-time 130 --data-binary @~/.ssh/id_ed25519.pub \\\n'
-    printf '       http://%s:%s/enroll\n\n' "$(device_ip)" "$ENROLL_PORT"
-    printf '   Then approve it here. This endpoint is open only while this\n'
-    printf '   screen is. Press q to close it.\n'
+    _ew_ip=$(device_ip)
+    printf '   On the computer you want to let in, open:\n'
+    printf '     http://%s:%s/\n\n' "${_ew_ip:-<device-ip>}" "$ENROLL_PORT"
+    printf '   It can make a key in the browser (download the private half) or\n'
+    printf '   take one you paste. Only the public key reaches the Kindle.\n'
+    printf '   Approve it here after checking the fingerprint matches.\n'
+    printf '   The endpoint is open only while this screen is. q to close.\n'
     while :; do
         enroll_process_pending
-        printf '   waiting for a key...  [enter] refresh, q to stop > '
+        printf '\n   waiting for a name...  [enter] refresh, q to stop > '
         read -t 5 _ew 2>/dev/null
         case "$_ew" in q|Q) break ;; esac
     done
@@ -2278,9 +2328,13 @@ request_update() {
 # hand. So when the installed version stops matching the build we are running,
 # restart into it.
 #
-# KFX_RELOADED survives the exec and stops this becoming a loop if the two can
-# never agree: a hand-edited VERSION, or a menu.sh the updater could not stamp.
-# One restart per version, then leave it alone and say so on the menu.
+# We reload only when the on-disk menu.sh actually carries the installed
+# version -- so a restart is guaranteed to resolve the mismatch and cannot loop.
+# This is self-healing: during a half-published update (VERSION already new, but
+# menu.sh still the old build, or the reverse) we wait, and the moment the file
+# catches up the next tick reloads into it. No "tried once" memory to get stuck
+# on -- the earlier one-shot guard left the front end stranded on the old build
+# after the file had already caught up.
 menu_self() {
     case "$0" in
         *menu.sh) [ -r "$0" ] && { printf '%s' "$0"; return 0; } ;;
@@ -2288,14 +2342,22 @@ menu_self() {
     printf '%s' "$(dirname "$CONF")/menu.sh"
 }
 
+# The KFX_BUILD stamp inside a menu.sh on disk, or empty if it cannot be read.
+menu_disk_build() {   # $1 = path to a menu.sh
+    sed -n 's/^KFX_BUILD=\([0-9.]*\).*/\1/p' "$1" 2>/dev/null | head -1
+}
+
 reload_if_stale() {
     [ -n "${KFX_BUILD:-}" ] || return 0
     _ri_v=$(installed_version)
     [ -n "$_ri_v" ] || return 0
-    [ "$_ri_v" = "$KFX_BUILD" ] && return 0
-    [ "${KFX_RELOADED:-}" = "$_ri_v" ] && return 1     # tried once already
+    [ "$_ri_v" = "$KFX_BUILD" ] && return 0            # already running it
     _ri_self=$(menu_self)
     [ -r "$_ri_self" ] || return 1
+    # Only restart if the file we would exec is that version; otherwise a
+    # restart lands on the same mismatch. Waiting here is the half-published
+    # case -- harmless, and it clears itself once the file catches up.
+    [ "$(menu_disk_build "$_ri_self")" = "$_ri_v" ] || return 1
     emit "front end restarting: $KFX_BUILD -> $_ri_v"
     flush_log
     clear 2>/dev/null
@@ -2304,8 +2366,6 @@ reload_if_stale() {
     uline "Restarting..."
     sleep 2
     if [ "${KFX_RELOAD_DRYRUN:-0}" = 1 ]; then printf 'would exec %s\n' "$_ri_self"; return 0; fi
-    KFX_RELOADED=$_ri_v
-    export KFX_RELOADED
     exec sh "$_ri_self"
 }
 
@@ -2675,11 +2735,14 @@ draw() {
     [ -n "$_mm_up" ] && printf '%s\n' \
         "$(short " 5) Install update $_mm_up (otherwise $(update_due_text))" "$W")"
     echo
-    if [ "$(installed_version)" != "$KFX_BUILD" ] && [ -n "$(installed_version)" ]; then
-        printf '%s\n' \
-            "$(short " ! running $KFX_BUILD, $(installed_version) installed -- reopen" "$W")"
+    # If a newer build is already on disk but this process is still the old one,
+    # the fix is a reopen -- so the U line says so, instead of a separate banner.
+    _mm_iv=$(installed_version)
+    if [ -n "$_mm_iv" ] && [ "$_mm_iv" != "$KFX_BUILD" ]; then
+        printf '%s\n' "$(short " U) Updates  ($_mm_iv ready -- reopen to run it)" "$W")"
+    else
+        printf ' U) Updates\n'
     fi
-    printf ' U) Updates\n'
     printf ' S) Settings\n'
     printf ' R) Refresh\n'
     printf ' L) Log\n'

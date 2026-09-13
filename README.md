@@ -213,23 +213,35 @@ installs through the updater with a checksum like everything else.
 
 - The binary is `dropbearmulti-armhf` (a soft-float `-armel` can join it for
   very old Kindles; the device picks by its float ABI).
-- **Key-only, no root login.** You log in as the dev account, whose home is
-  `/mnt/us`, so `authorized_keys` is at `/mnt/us/.ssh/authorized_keys` --
-  writable, unlike root's on the read-only rootfs.
+- **Key-only, no root login.** You log in as the `kfx` account (created
+  automatically with a random password nothing reads), whose home is
+  `/var/local/kfx` on ext3 -- a real filesystem, so `dropbear` trusts the
+  ownership and permissions of `~/.ssh/authorized_keys`. It refuses that file on
+  FAT (`/mnt/us`) or when it is owned by root, silently, so the home lives here
+  and the account owns the tree.
 - **Enrol a key over the network** (Settings -> Enrol an SSH key): the device
-  opens a short HTTP window, the host POSTs its **public** key, and you approve
-  it on the Kindle -- the endpoint only queues the request, and nothing is
-  written to `authorized_keys` without a YES on the device.
+  opens a short HTTP window. The **requester generates its own keypair** and
+  sends only the **public** half plus a name; you approve it on the Kindle by
+  pressing `y` after checking the fingerprint matches. Nothing secret ever
+  crosses the wire -- the private key stays with the requester -- so the plain
+  HTTP and the device's pbkdf2-less openssl never matter. The `y` is the
+  authorisation; the fingerprint compare guards against a key swapped in transit.
+  The enrol page can make the key **in the browser** (a download button hands
+  over the private half; only the public half is submitted) using a vendored
+  `nacl.min.js` (WebCrypto is unavailable over plain HTTP), or take one you
+  paste. Or do it from a terminal:
   ```sh
-  curl --max-time 130 --data-binary @~/.ssh/id_ed25519.pub http://<kindle>:2223/enroll
+  ssh-keygen -t ed25519 -f kfx_key -N "" -C laptop
+  curl -s --data-urlencode 'name=laptop' \
+       --data-urlencode "key=$(cat kfx_key.pub)" http://<kindle>:2223/enroll
+  ssh -i kfx_key -p 2222 kfx@<kindle-ip>
   ```
-  Or, offline, drop the public key at `/mnt/us/import_key.pub` and turning SSH
-  on imports it. Either way a private key never crosses the wire.
+  Enrolments are recorded (name / when / fingerprint) in `kfx-state/enrolled`.
 - The host key is generated on the device on first start and kept in state, so
   a client's fingerprint check stays stable.
 
 ```sh
-ssh -p 2222 kfx@<kindle-ip>
+ssh -i kfx_key -p 2222 kfx@<kindle-ip>
 ```
 
 ## The jam
