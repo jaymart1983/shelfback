@@ -232,9 +232,15 @@ installs through the updater with a checksum like everything else.
 - **Key-only, no root login.** You log in as the dev account, whose home is
   `/mnt/us`, so `authorized_keys` is at `/mnt/us/.ssh/authorized_keys` --
   writable, unlike root's on the read-only rootfs.
-- Enrol a key by dropping your **public** key at `/mnt/us/import_key.pub` (over
-  the dev FTP or USB); turning SSH on imports it. A private key never crosses
-  the wire.
+- **Enrol a key over the network** (Settings -> Enrol an SSH key): the device
+  opens a short HTTP window, the host POSTs its **public** key, and you approve
+  it on the Kindle -- the endpoint only queues the request, and nothing is
+  written to `authorized_keys` without a YES on the device.
+  ```sh
+  curl --max-time 130 --data-binary @~/.ssh/id_ed25519.pub http://<kindle>:2223/enroll
+  ```
+  Or, offline, drop the public key at `/mnt/us/import_key.pub` and turning SSH
+  on imports it. Either way a private key never crosses the wire.
 - The host key is generated on the device on first start and kept in state, so
   a client's fingerprint check stays stable.
 

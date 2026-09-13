@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09132026.0847   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09132026.0854   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -2194,6 +2194,106 @@ ssh_add_key() {   # $1 = a public key line (type base64 [comment])
     SSH_KEY_ERR=""; return 0
 }
 
+# --- enrolling a key over the network ------------------------------------
+# A short attended window: the device serves an HTTP endpoint, a host POSTs its
+# public key, and the owner approves it here on the Kindle. The endpoint only
+# queues the request; this loop is the only thing that writes authorized_keys,
+# and only after a YES. It listens only while this window is open.
+ENROLL_PORT=${ENROLL_PORT:-2223}
+ENROLL_DIR=${ENROLL_DIR:-/tmp/kfx-enroll}
+ENROLL_PIDS=${ENROLL_PIDS:-/tmp/kfx-enroll.pids}
+ENROLL_SERVE=${ENROLL_SERVE:-$(dirname "$CONF")/enroll-serve.sh}
+
+# The SHA256 fingerprint of an offered public key, in ssh's own format when
+# openssl is here, else a plain hash so there is still something to eyeball.
+pubkey_fp() {   # $1 = full key line
+    _pf_blob=$(printf '%s' "$1" | awk '{print $2}')
+    [ -n "$_pf_blob" ] || { printf '(no key body)'; return; }
+    if command -v openssl >/dev/null 2>&1; then
+        _pf=$(printf '%s' "$_pf_blob" | openssl base64 -d -A 2>/dev/null \
+              | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null)
+        [ -n "$_pf" ] && { printf 'SHA256:%s' "$(printf '%s' "$_pf" | sed 's/=*$//')"; return; }
+    fi
+    printf 'sha256 %s' "$( (printf '%s' "$_pf_blob" | sha256sum 2>/dev/null) | cut -c1-32)"
+}
+
+enroll_running() { server_up "$ENROLL_PORT" "$ENROLL_PIDS"; }
+enroll_stop() {
+    [ -s "$ENROLL_PIDS" ] && while read -r _ep; do kill "$_ep" 2>/dev/null; done < "$ENROLL_PIDS"
+    rm -f "$ENROLL_PIDS"
+    fw_close "$ENROLL_PORT"
+}
+enroll_start() {
+    command -v tcpsvd >/dev/null 2>&1 || { ENROLL_HOW="no tcpsvd"; return 1; }
+    [ -x "$ENROLL_SERVE" ] || [ -f "$ENROLL_SERVE" ] || { ENROLL_HOW="enroll-serve.sh missing"; return 1; }
+    rm -rf "$ENROLL_DIR"; mkdir -p "$ENROLL_DIR/pending" "$ENROLL_DIR/decision" 2>/dev/null
+    : > "$ENROLL_PIDS"
+    # No -E: we WANT tcpsvd to set TCPREMOTEIP so the prompt can name the host.
+    ENROLL_DIR="$ENROLL_DIR" setsid tcpsvd -v 0.0.0.0 "$ENROLL_PORT" sh "$ENROLL_SERVE" >/dev/null 2>&1 &
+    echo $! >> "$ENROLL_PIDS"
+    sleep 2
+    if enroll_running; then fw_open "$ENROLL_PORT"; return 0; fi
+    while read -r _ep; do kill "$_ep" 2>/dev/null; done < "$ENROLL_PIDS" 2>/dev/null
+    rm -f "$ENROLL_PIDS"; ENROLL_HOW="did not start on $ENROLL_PORT"; return 1
+}
+
+# Handle any requests waiting in the spool: show each, ask, act. Returns the
+# number handled. Kept separate so it can be tested without the read loop.
+enroll_process_pending() {
+    _epp_n=0
+    for _epp_f in "$ENROLL_DIR"/pending/*; do
+        [ -f "$_epp_f" ] || continue
+        _epp_id=$(basename "$_epp_f")
+        _epp_ip=$(sed -n 's/^ip=//p' "$_epp_f" | head -1)
+        _epp_key=$(sed -n 's/^key=//p' "$_epp_f" | head -1)
+        echo
+        printf '   a host wants to enrol an SSH key:\n'
+        printf '     from: %s\n' "${_epp_ip:-unknown}"
+        printf '     type: %s\n' "$(printf '%s' "$_epp_key" | awk '{print $1}')"
+        printf '     note: %s\n' "$(printf '%s' "$_epp_key" | awk '{print $3}')"
+        printf '     %s\n' "$(pubkey_fp "$_epp_key")"
+        printf '   approve this key? type YES > '
+        read _epp_ans 2>/dev/null
+        if [ "$_epp_ans" = YES ] && ssh_add_key "$_epp_key"; then
+            echo approve > "$ENROLL_DIR/decision/$_epp_id"
+            printf '   enrolled. %s key(s) now.\n' "$(ssh_keys)"
+        else
+            echo deny > "$ENROLL_DIR/decision/$_epp_id"
+            printf '   denied%s\n' "$([ -n "$SSH_KEY_ERR" ] && printf ' (%s)' "$SSH_KEY_ERR")"
+        fi
+        # Remove the request now so a refresh cannot re-prompt it before the
+        # handler (which is reading the decision) clears it.
+        rm -f "$_epp_f"
+        _epp_n=$((_epp_n + 1))
+    done
+    return 0
+}
+
+enroll_window() {
+    clear 2>/dev/null
+    rule; printf ' enrol an SSH key\n'; rule; echo
+    if ! enroll_start; then
+        printf '   could not open the endpoint: %s\n' "$ENROLL_HOW"
+        echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
+    fi
+    acct_exists || printf '   NOTE: no dev account yet -- create it (option 8) or\n   the enrolled key cannot be used until you do.\n\n'
+    printf '   On the host you want to let in, run:\n'
+    printf '     curl --max-time 130 --data-binary @~/.ssh/id_ed25519.pub \\\n'
+    printf '       http://%s:%s/enroll\n\n' "$(device_ip)" "$ENROLL_PORT"
+    printf '   Then approve it here. This endpoint is open only while this\n'
+    printf '   screen is. Press q to close it.\n'
+    while :; do
+        enroll_process_pending
+        printf '   waiting for a key...  [enter] refresh, q to stop > '
+        read -t 5 _ew 2>/dev/null
+        case "$_ew" in q|Q) break ;; esac
+    done
+    enroll_stop
+    rm -rf "$ENROLL_DIR"
+    printf '\n   enrolment closed.\n'
+    echo; printf ' [enter] > '; read _x 2>/dev/null
+}
+
 ssh_text() {
     if ssh_running; then
         if ! ssh_ours; then printf 'busy'
@@ -2478,6 +2578,7 @@ settings_menu() {
         "$REMOTE_DEV_PORT" "$(remote_wanted && echo ON || echo off)"
         printf '   8) FTP login: %s\n' "$(acct_exists && echo "set ($FTP_USER)" || echo "not created")"
         printf '   9) SSH (dev, port %s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo ON || echo off)"
+        printf '  10) Enrol an SSH key over the network\n'
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -2602,6 +2703,7 @@ settings_menu() {
                    fi
                fi
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
+            10) enroll_window ;;
             3) clear 2>/dev/null
                tail -30 /mnt/us/kfx-daemon.log 2>/dev/null | sed 's/^/  /' || echo "  no log yet"
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
