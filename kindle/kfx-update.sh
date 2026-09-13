@@ -229,6 +229,11 @@ UPDATE_STATE=${UPDATE_STATE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_STATE}
 # build stayed alive writing to that build's log path, while the daemon saw a
 # running updater and never started the new one.
 UPDATE_BUILD=${UPDATE_BUILD:-${STATEDIR:-/var/local/kfx-state}/UPDATE_BUILD}
+# Automatic install is opt-in. Off (default): a newer build is announced
+# and waits for the owner to install it. On: it installs itself on the
+# schedule. The menu toggles this file.
+AUTO_UPDATE=${AUTO_UPDATE:-${STATEDIR:-/var/local/kfx-state}/AUTO_UPDATE}
+auto_update_on() { [ -f "$AUTO_UPDATE" ]; }
 
 # One line the menu can show without reading a log: what happened last.
 set_state() { mkdir -p "$(dirname "$UPDATE_STATE")" 2>/dev/null
@@ -237,8 +242,15 @@ set_state() { mkdir -p "$(dirname "$UPDATE_STATE")" 2>/dev/null
 announce() {   # $1 = the version found
     mkdir -p "$(dirname "$UPDATE_AVAIL")" 2>/dev/null
     printf '%s\n' "$1" > "$UPDATE_AVAIL"
-    [ -f "$UPDATE_DUE" ] || printf '%s\n' "$(( $(date +%s) + UPDATE_DELAY ))" > "$UPDATE_DUE"
-    set_state "update available ($1)"
+    # A deadline -- and therefore an automatic install -- only when the owner
+    # has turned automatic updates on. Otherwise it waits to be installed.
+    if auto_update_on; then
+        [ -f "$UPDATE_DUE" ] || printf '%s\n' "$(( $(date +%s) + UPDATE_DELAY ))" > "$UPDATE_DUE"
+        set_state "update available ($1), auto-installing"
+    else
+        rm -f "$UPDATE_DUE" 2>/dev/null
+        set_state "update available ($1)"
+    fi
 }
 forget_update() { rm -f "$UPDATE_AVAIL" "$UPDATE_DUE" "$UPDATE_GO" 2>/dev/null; }
 

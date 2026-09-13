@@ -2349,6 +2349,10 @@ UPDATE_STATE=${UPDATE_STATE:-${STATEDIR:-/var/local/kfx-state}/UPDATE_STATE}
 ULOG=${ULOG:-/mnt/us/kfx-update.log}
 
 installed_version() { cat "${BASE:-/mnt/us/extensions/kfx-sync}/VERSION" 2>/dev/null; }
+AUTO_UPDATE=${AUTO_UPDATE:-${STATEDIR:-/var/local/kfx-state}/AUTO_UPDATE}
+auto_update_wanted() { [ -f "$AUTO_UPDATE" ]; }
+auto_update_on()  { mkdir -p "$(dirname "$AUTO_UPDATE")" 2>/dev/null; : > "$AUTO_UPDATE"; }
+auto_update_off() { rm -f "$AUTO_UPDATE" 2>/dev/null; }
 
 # One line for the panel. The updater writes its own state in words meant to be
 # read here, so this mostly passes it through -- an announced update is the one
@@ -2465,8 +2469,17 @@ updates_screen() {
     _us_a=$(update_available)
     if [ -n "$_us_a" ]; then
         echo
-        uline "Version $_us_a will install $(update_due_text)."
-        uline "Choose Install Update on the main menu to do it now."
+        if auto_update_wanted; then
+            uline "Version $_us_a will install $(update_due_text) (auto)."
+        else
+            uline "Version $_us_a is available."
+        fi
+        printf '   install it now? type YES > '
+        read _us_go 2>/dev/null
+        if [ "$_us_go" = YES ]; then
+            install_update_screen
+            return 0
+        fi
     fi
     echo; printf ' [enter] > '; read _x 2>/dev/null
 }
@@ -2605,6 +2618,7 @@ settings_menu() {
         printf '   8) FTP login: %s\n' "$(acct_exists && echo "set ($FTP_USER)" || echo "not created")"
         printf '   9) SSH (dev, port %s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo ON || echo off)"
         printf '  10) Enrol an SSH key over the network\n'
+        printf '  11) Automatic updates: %s\n' "$(auto_update_wanted && echo ON || echo off)"
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -2732,6 +2746,20 @@ settings_menu() {
                fi
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
             10) enroll_window ;;
+            11) clear 2>/dev/null; echo
+                if auto_update_wanted; then
+                    auto_update_off
+                    printf '   Automatic updates OFF.\n'
+                    printf '   New builds are announced; you install them from\n'
+                    printf '   the Updates screen when you choose.\n'
+                else
+                    auto_update_on
+                    printf '   Automatic updates ON.\n'
+                    printf '   The device checks every ~15 min and installs a\n'
+                    printf '   newer build on its own, a few minutes after it\n'
+                    printf '   appears. It never installs an older one.\n'
+                fi
+                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
             3) clear 2>/dev/null
                tail -30 /mnt/us/kfx-daemon.log 2>/dev/null | sed 's/^/  /' || echo "  no log yet"
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
