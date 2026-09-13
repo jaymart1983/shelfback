@@ -347,6 +347,7 @@ loop() {
         # to be there whenever the device is.
         log_ftp_ensure
         remote_ensure
+        ssh_ensure           # dropbear, if its toggle is on
         else
             # The menu is driving. Stay out of its way rather than racing it.
             dlog "skipped: $(lock_holder) holds the run lock"

@@ -159,6 +159,10 @@ again.
   anywhere until its port is opened in the firewall, which happens when the
   server starts and is undone when it stops. The panel shows which one is in
   use.
+- **Settings -> SSH** runs a static **dropbear** we build from source (see
+  [SSH](#ssh)), key-only, as the dev account, on port 2222. Off by default;
+  once on it survives a UI restart and reboot, and the firewall opens with it.
+  The device generates its own host key on first start.
 
 ### When something is wrong
 
@@ -213,6 +217,30 @@ deleted, and accepts only: `run`, `stop`, `restart-ui`, `update`, `remote-on`,
 Nothing in that vocabulary reboots the device or deletes anything: whoever can
 write the file is whoever can reach the FTP port, which is not a reason to
 trust them with more.
+
+## SSH
+
+Real key-based SSH, from a static `dropbear` we build for this device rather
+than trust a prebuilt -- none of the community binaries matched (soft-float, or
+wanting a newer glibc than this firmware has). `kindle/build-dropbear.sh`
+reproduces it: official DROPBEAR source, a musl cross-toolchain, fully
+**static** so one binary spans Kindle firmwares. It ships in the repo and
+installs through the updater with a checksum like everything else.
+
+- The binary is `dropbearmulti-armhf` (a soft-float `-armel` can join it for
+  very old Kindles; the device picks by its float ABI).
+- **Key-only, no root login.** You log in as the dev account, whose home is
+  `/mnt/us`, so `authorized_keys` is at `/mnt/us/.ssh/authorized_keys` --
+  writable, unlike root's on the read-only rootfs.
+- Enrol a key by dropping your **public** key at `/mnt/us/import_key.pub` (over
+  the dev FTP or USB); turning SSH on imports it. A private key never crosses
+  the wire.
+- The host key is generated on the device on first start and kept in state, so
+  a client's fingerprint check stays stable.
+
+```sh
+ssh -p 2222 kfx@<kindle-ip>
+```
 
 ## The jam
 

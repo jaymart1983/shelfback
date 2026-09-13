@@ -7,7 +7,7 @@
 
 # Which code this is: the deploy time, mmddyyyy.hhmm. Shown at the top right
 # of the menu and in the log. Set by deploy.sh -- do not edit by hand.
-KFX_BUILD=09132026.0837   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
+KFX_BUILD=09132026.0847   # stamped by deploy.sh: mmddyyyy.hhmm of the deploy
 
 CONF=${CONF:-/mnt/us/extensions/kfx-sync/config}
 [ -r "$CONF" ] && . "$CONF"
@@ -2038,7 +2038,9 @@ create_ftp_user() {   # $1 = plaintext password
     # Build both files without our old line, then append the new one. Editing
     # in a temp and moving means a half-written file is never the live one.
     grep -v "^$FTP_USER:" "$PASSWD_FILE" > "$PASSWD_FILE.new.$$" 2>/dev/null
-    printf '%s:x:%s:%s:kfx ftp:/mnt/us:/bin/false\n' "$FTP_USER" "$_cu_uid" "$_cu_uid" >> "$PASSWD_FILE.new.$$"
+    # /bin/sh, not /bin/false: this account is used for SSH dev access too,
+    # which needs a shell. FTP does not care either way.
+    printf '%s:x:%s:%s:kfx dev:/mnt/us:/bin/sh\n' "$FTP_USER" "$_cu_uid" "$_cu_uid" >> "$PASSWD_FILE.new.$$"
     grep -v "^$FTP_USER:" "$SHADOW_FILE" > "$SHADOW_FILE.new.$$" 2>/dev/null
     printf '%s:%s:19000:0:99999:7:::\n' "$FTP_USER" "$_cu_hash" >> "$SHADOW_FILE.new.$$"
 
@@ -2065,6 +2067,140 @@ create_ftp_user() {   # $1 = plaintext password
     fi
     $REMOUNT_RO 2>/dev/null
     return 0
+}
+
+# --- SSH (dropbear) --------------------------------------------------------
+# The static dropbear we built runs as its own standalone server (unlike ftpd,
+# it does its own listen/accept -- no tcpsvd in front). Key-only auth, no root
+# login: you log in as the kfx account, whose home is /mnt/us, so its
+# authorized_keys lives at /mnt/us/.ssh/authorized_keys -- writable, unlike
+# root's on the read-only rootfs.
+SSH_PORT=${SSH_PORT:-2222}
+SSH_FLAG=${SSH_FLAG:-${STATEDIR:-/var/local/kfx-state}/SSH_ON}
+SSH_PID=${SSH_PID:-/tmp/kfx-dropbear.pid}
+SSH_DIR=${SSH_DIR:-/mnt/us/.ssh}
+SSH_AUTHKEYS=${SSH_AUTHKEYS:-$SSH_DIR/authorized_keys}
+SSH_HOSTKEY=${SSH_HOSTKEY:-${STATEDIR:-/var/local/kfx-state}/dropbear_ed25519_host_key}
+
+# armhf now; armel would join for old soft-float Kindles. Pick by the loader the
+# firmware ships -- a static hardfloat binary needs a hardfloat CPU, and the
+# armhf loader's presence is the reliable sign of one.
+ssh_bin() {
+    _sb_base=${BASE:-$(dirname "$CONF")}
+    if [ -e /lib/ld-linux-armhf.so.3 ] && [ -f "$_sb_base/dropbearmulti-armhf" ]; then
+        printf '%s' "$_sb_base/dropbearmulti-armhf"
+    elif [ -f "$_sb_base/dropbearmulti-armel" ]; then
+        printf '%s' "$_sb_base/dropbearmulti-armel"
+    else
+        printf '%s' "$_sb_base/dropbearmulti-armhf"   # best guess; may not exist
+    fi
+}
+ssh_have_bin() { _hb=$(ssh_bin); [ -f "$_hb" ]; }
+
+ssh_running() { server_up "$SSH_PORT" "$SSH_PID"; }
+ssh_wanted()  { [ -f "$SSH_FLAG" ]; }
+ssh_want_on() { mkdir -p "$(dirname "$SSH_FLAG")" 2>/dev/null; : > "$SSH_FLAG"; }
+ssh_want_off(){ rm -f "$SSH_FLAG" 2>/dev/null; }
+ssh_ours()    { pids_alive "$SSH_PID"; }
+ssh_keys()    { grep -cE '^(ssh-|ecdsa-|sk-)' "$SSH_AUTHKEYS" 2>/dev/null || echo 0; }
+
+# Make the host key once, with our own dropbearkey (the multi-binary). It lives
+# in STATEDIR so it is stable across restarts -- a changing host key would make
+# every client warn about a changed fingerprint.
+ssh_ensure_hostkey() {
+    [ -s "$SSH_HOSTKEY" ] && return 0
+    _hb=$(ssh_bin); [ -f "$_hb" ] || return 1
+    mkdir -p "$(dirname "$SSH_HOSTKEY")" 2>/dev/null
+    "$_hb" dropbearkey -t ed25519 -f "$SSH_HOSTKEY" >/dev/null 2>&1
+    [ -s "$SSH_HOSTKEY" ]
+}
+
+ssh_fingerprint() {
+    _hb=$(ssh_bin); [ -f "$_hb" ] && [ -s "$SSH_HOSTKEY" ] || return 1
+    "$_hb" dropbearkey -y -f "$SSH_HOSTKEY" 2>/dev/null | grep -i fingerprint | head -1
+}
+
+ssh_stop() {
+    [ -s "$SSH_PID" ] && kill "$(cat "$SSH_PID" 2>/dev/null)" 2>/dev/null
+    # dropbear may have re-forked; sweep any of ours by name on our port too.
+    for _p in $(all_ssh_pids); do kill "$_p" 2>/dev/null; done
+    rm -f "$SSH_PID"
+    fw_close "$SSH_PORT"
+}
+
+all_ssh_pids() {
+    for _d in "${PROCDIR:-/proc}"/[0-9]*; do
+        grep -qa 'dropbearmulti' "$_d/cmdline" 2>/dev/null || continue
+        grep -qa 'dropbear'      "$_d/cmdline" 2>/dev/null || continue
+        echo "${_d##*/}"
+    done
+}
+
+# Start dropbear: key-only (-s), no root login (-w), its own host key (-r),
+# our port (-p), pidfile (-P). It daemonizes itself; setsid so a framework
+# restart cannot take it down with the menu.
+ssh_start() {
+    _hb=$(ssh_bin)
+    [ -f "$_hb" ] || { SSH_HOW="no dropbear binary (need $(basename "$_hb"))"; return 1; }
+    chmod +x "$_hb" 2>/dev/null
+    acct_exists || { SSH_HOW="no login account -- create it in Settings first"; return 1; }
+    ssh_ensure_hostkey || { SSH_HOW="could not generate a host key"; return 1; }
+    mkdir -p "$SSH_DIR" 2>/dev/null
+    [ -f "$SSH_AUTHKEYS" ] || : > "$SSH_AUTHKEYS"
+    chmod 700 "$SSH_DIR" 2>/dev/null; chmod 600 "$SSH_AUTHKEYS" 2>/dev/null
+    rm -f "$SSH_PID"
+    setsid "$_hb" dropbear -s -w -r "$SSH_HOSTKEY" -p "$SSH_PORT" -P "$SSH_PID" >/dev/null 2>&1 &
+    sleep 2
+    if ssh_running; then
+        fw_open "$SSH_PORT" || SSH_HOW="running but firewall not opened"
+        [ -z "$SSH_HOW" ] && SSH_HOW="dropbear"
+        return 0
+    fi
+    SSH_HOW="dropbear did not stay up"; rm -f "$SSH_PID"; return 1
+}
+
+ssh_ensure() {
+    ssh_wanted || return 0
+    if ssh_running; then
+        if ssh_ours; then fw_is_open "$SSH_PORT"; [ "$?" = 1 ] && fw_open "$SSH_PORT"; fi
+        return 0
+    fi
+    if ssh_start; then emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $FTP_USER)"; fi
+    return 0
+}
+
+# Add one public key to authorized_keys, validated. Accepts a file or a string.
+# Rejects anything that is not a single well-formed key line -- no newlines,
+# no forced-command options that could turn an authorized key into a backdoor.
+ssh_add_key() {   # $1 = a public key line (type base64 [comment])
+    _ak_line=$(printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$_ak_line" in
+        ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-*\ *) ;;
+        *) SSH_KEY_ERR="not a recognised public key line"; return 1 ;;
+    esac
+    # exactly one line, and no option prefix (must start with the key type)
+    case "$_ak_line" in
+        *"
+"*) SSH_KEY_ERR="more than one line"; return 1 ;;
+    esac
+    mkdir -p "$SSH_DIR" 2>/dev/null
+    # de-dupe on the base64 body (field 2), so re-adding a key does nothing.
+    _ak_body=$(printf '%s' "$_ak_line" | awk '{print $2}')
+    if [ -f "$SSH_AUTHKEYS" ] && [ -n "$_ak_body" ] && grep -qF "$_ak_body" "$SSH_AUTHKEYS" 2>/dev/null; then
+        SSH_KEY_ERR=""; return 0
+    fi
+    printf '%s\n' "$_ak_line" >> "$SSH_AUTHKEYS"
+    chmod 700 "$SSH_DIR" 2>/dev/null; chmod 600 "$SSH_AUTHKEYS" 2>/dev/null
+    SSH_KEY_ERR=""; return 0
+}
+
+ssh_text() {
+    if ssh_running; then
+        if ! ssh_ours; then printf 'busy'
+        else fw_is_open "$SSH_PORT"; [ "$?" = 1 ] && printf 'on, blocked' || printf 'on :%s' "$SSH_PORT"; fi
+    elif ssh_wanted; then printf 'on, not answering'
+    else printf 'off'
+    fi
 }
 
 device_ip() { ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1; }
@@ -2341,6 +2477,7 @@ settings_menu() {
         printf '   7) Dev FTP (read-write, port %s): %s\n' \
         "$REMOTE_DEV_PORT" "$(remote_wanted && echo ON || echo off)"
         printf '   8) FTP login: %s\n' "$(acct_exists && echo "set ($FTP_USER)" || echo "not created")"
+        printf '   9) SSH (dev, port %s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo ON || echo off)"
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -2395,7 +2532,7 @@ settings_menu() {
                printf '   touched, and the change is undone if anything looks\n'
                printf '   wrong -- but it is the one setting that edits the\n'
                printf '   system, so it asks before doing it.\n\n'
-               printf '   a no-login account, home /mnt/us, for FTP only.\n\n'
+               printf '   a dev account, home /mnt/us, for FTP and SSH.\n\n'
                printf '   type a password for it (blank to cancel) > '
                read _pw 2>/dev/null
                if [ -z "$_pw" ]; then
@@ -2412,6 +2549,57 @@ settings_menu() {
                        3) printf '\n   the change did not validate and was undone.\n'
                           printf '   nothing was altered.\n' ;;
                    esac
+               fi
+               echo; printf ' [enter] > '; read _x 2>/dev/null ;;
+            9) clear 2>/dev/null; echo
+               if ssh_wanted; then
+                   ssh_want_off; ssh_stop
+                   emit "ssh: turned off"
+                   printf '   SSH is off.\n'
+               elif ! ssh_have_bin; then
+                   printf '   The dropbear binary is not installed:\n'
+                   printf '   %s\n' "$(ssh_bin)"
+               elif ! acct_exists; then
+                   printf '   No dev account yet. Create one with option 8,\n'
+                   printf '   then turn on SSH.\n'
+               else
+                   # A key is required -- this is key-only auth. Import one from
+                   # the drop file if the user left it there over FTP/USB.
+                   if [ "$(ssh_keys)" -eq 0 ] && [ -s /mnt/us/import_key.pub ]; then
+                       if ssh_add_key "$(cat /mnt/us/import_key.pub)"; then
+                           printf '   imported the key from /mnt/us/import_key.pub\n'
+                           rm -f /mnt/us/import_key.pub
+                       else
+                           printf '   /mnt/us/import_key.pub is not a valid key: %s\n' "$SSH_KEY_ERR"
+                       fi
+                   fi
+                   if [ "$(ssh_keys)" -eq 0 ]; then
+                       printf '   No authorized keys yet, and SSH here is key-only.\n'
+                       printf '   Add your PUBLIC key one of these ways, then retry:\n'
+                       printf '    - drop it at /mnt/us/import_key.pub (via dev FTP\n'
+                       printf '      or USB); I will import it, or\n'
+                       printf '    - append it to %s\n' "$SSH_AUTHKEYS"
+                   else
+                       printf '   Starts dropbear on port %s, key-only, no root.\n' "$SSH_PORT"
+                       printf '   Log in: ssh -p %s %s@%s\n\n' "$SSH_PORT" "$FTP_USER" "$(device_ip)"
+                       printf '   %s authorized key(s).\n' "$(ssh_keys)"
+                       printf '   type YES to turn it on > '
+                       read _ss 2>/dev/null
+                       if [ "$_ss" = "YES" ]; then
+                           ssh_want_on
+                           if ssh_start; then
+                               emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $FTP_USER)"
+                               printf '\n   on: ssh -p %s %s@%s\n' "$SSH_PORT" "$FTP_USER" "$(device_ip)"
+                               printf '   host %s\n' "$(ssh_fingerprint)"
+                               printf '   stays on, through a UI restart, until turned off\n'
+                           else
+                               printf '\n   could not start: %s\n' "$SSH_HOW"
+                               printf '   left ON, so the daemon will keep trying\n'
+                           fi
+                       else
+                           printf '\n   cancelled\n'
+                       fi
+                   fi
                fi
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
             3) clear 2>/dev/null
@@ -2472,7 +2660,8 @@ draw() {
     # longer than half a screen. The address shares a row with the FTP ports,
     # because neither is useful without the other.
     two ' updates:'  "$(update_panel_text)" '' ''
-    two ' ip:'       "$(stat_or "$(device_ip)")" 'ftp:' "$(remote_text)"
+    two ' ip:'       "$(stat_or "$(device_ip)")" 'ssh:' "$(ssh_text)"
+    two ' ftp:'      "$(remote_text)" '' ''
     # Someone reading or writing this Kindle's storage is worth more than a
     # column: it is a server with no password, and the owner should be able to
     # see it is in use without going looking.
