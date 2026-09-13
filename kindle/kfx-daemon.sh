@@ -335,9 +335,10 @@ loop() {
             DO_CLOUD=; DO_RESEND=; DO_PURGE=; DO_SWEEP=
             drop_lock
             maybe_recover_wedge
+        logsrv_ensure        # anonymous HTTP log server (on by default)
         ssh_ensure           # dropbear, if its toggle is on -- the framework
                              # restart that clears a jam kills what the menu
-                             # started, so the daemon puts it back
+                             # started, so the daemon puts them back
         else
             # The menu is driving. Stay out of its way rather than racing it.
             dlog "skipped: $(lock_holder) holds the run lock"

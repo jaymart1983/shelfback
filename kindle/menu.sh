@@ -1795,6 +1795,58 @@ fw_is_open() {   # $1 = port
     return 1
 }
 
+# --- the anonymous HTTP log server ----------------------------------------
+# Read the logs from a browser or curl, no login: http://<ip>:2121/. It is
+# HTTP, not FTP -- tcpsvd runs serve-logs.sh, which only ever reads a
+# whitelisted file out of LOGDIR, so it cannot write and cannot escape that
+# directory. On by default; a flag in config turns it off. The firewall opens
+# with it. This is how logs (including dropbear.log) are read off the device
+# without a USB cable.
+LOG_PORT=${LOG_PORT:-2121}
+LOG_PIDS=${LOG_PIDS:-/tmp/kfx-logsrv.pids}
+LOG_OFF=${LOG_OFF:-${STATEDIR:-/var/local/kfx-state}/LOGSERVER_OFF}
+LOGSERVER=${LOGSERVER:-$(dirname "$CONF")/serve-logs.sh}
+
+logsrv_running() { server_up "$LOG_PORT" "$LOG_PIDS"; }
+logsrv_ours()    { pids_alive "$LOG_PIDS"; }
+logsrv_wanted()  { [ ! -f "$LOG_OFF" ]; }
+logsrv_stop() {
+    [ -s "$LOG_PIDS" ] && while read -r _lp; do kill "$_lp" 2>/dev/null; done < "$LOG_PIDS"
+    rm -f "$LOG_PIDS"
+    fw_close "$LOG_PORT"
+}
+logsrv_ensure() {
+    logsrv_wanted || { logsrv_running && logsrv_stop; return 0; }
+    if logsrv_running; then
+        # Already up: open the firewall if it is not, but only for a server we
+        # started -- never for something else that happens to hold the port.
+        if logsrv_ours; then fw_is_open "$LOG_PORT"; [ "$?" = 1 ] && fw_open "$LOG_PORT"; fi
+        return 0
+    fi
+    command -v tcpsvd >/dev/null 2>&1 || return 1
+    [ -f "$LOGSERVER" ] || return 1
+    mkdir -p "$LOGDIR" 2>/dev/null
+    : > "$LOG_PIDS"
+    LOGDIR="$LOGDIR" setsid tcpsvd -vE 0.0.0.0 "$LOG_PORT" sh "$LOGSERVER" >/dev/null 2>&1 &
+    echo $! >> "$LOG_PIDS"
+    sleep 2
+    if logsrv_running; then
+        fw_open "$LOG_PORT"
+        emit "logs at http://$(device_ip):$LOG_PORT/ (anonymous, read-only)"
+        return 0
+    fi
+    while read -r _lp; do kill "$_lp" 2>/dev/null; done < "$LOG_PIDS" 2>/dev/null
+    rm -f "$LOG_PIDS"; return 1
+}
+logsrv_text() {
+    if logsrv_running; then
+        if ! logsrv_ours; then printf 'busy'
+        else fw_is_open "$LOG_PORT"; [ "$?" = 1 ] && printf 'on, blocked' || printf 'http :%s' "$LOG_PORT"; fi
+    elif logsrv_wanted; then printf 'starting'
+    else printf 'off'
+    fi
+}
+
 
 # --- the SSH dev account --------------------------------------------------
 # dropbear authenticates a key login against a real system account, so one has
@@ -2584,6 +2636,7 @@ draw() {
     # longer than half a screen. The address shares its row with SSH state.
     two ' updates:'  "$(update_panel_text)" '' ''
     two ' ip:'       "$(stat_or "$(device_ip)")" 'ssh:' "$(ssh_text)"
+    two ' logs:'     "$(logsrv_text)" '' ''
     rule
     # Books.
     two ' decrypted:' "$(stat_or "$(state_get N_SYNCED)")" \
