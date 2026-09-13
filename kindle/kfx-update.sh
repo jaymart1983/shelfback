@@ -58,6 +58,11 @@ fetch_all() {
         say "could not fetch the manifest"; return 1
     fi
     [ -s "$STAGE/MANIFEST" ] || { say "the manifest is empty"; return 1; }
+    # Checksums travel with the release. A file that does not match its listed
+    # hash is a truncated or half-published download -- the CDN refreshes files
+    # and this list independently -- so a mismatch means "wait", not "install".
+    curl -sS --max-time "$CURL_MAX" -o "$STAGE/SHA256SUMS" \
+         "$UPDATE_URL/SHA256SUMS" 2>/dev/null </dev/null || :
     _fa_n=0
     while read -r _fa_f; do
         case "$_fa_f" in ''|'#'*) continue ;; esac
@@ -81,21 +86,34 @@ fetch_all() {
 # ---------------- verify ----------------
 # Cheap checks, but they catch what actually goes wrong over a flaky link: a
 # truncated file, an HTML error page saved as a script, a half-written commit.
+# sha256 of a file, however this build spells the tool.
+sha_of() {
+    ( sha256sum "$1" 2>/dev/null || openssl dgst -sha256 "$1" 2>/dev/null ) \
+        | grep -oE '[0-9a-f]{64}' | head -1
+}
+
 verify_stage() {
     _vs_bad=0
     while read -r _vs_f; do
         case "$_vs_f" in ''|'#'*) continue ;; esac
         [ -s "$STAGE/$_vs_f" ] || { say "missing after fetch: $_vs_f"; _vs_bad=1; continue; }
+        # Every file must match its listed checksum. This is what makes it safe
+        # to ship a binary the same way as a script: no parse check can vouch
+        # for a binary, but a hash can.
+        _vs_want=$(awk -v f="$_vs_f" '$2 == f {print $1}' "$STAGE/SHA256SUMS" 2>/dev/null)
+        if [ -n "$_vs_want" ]; then
+            _vs_got=$(sha_of "$STAGE/$_vs_f")
+            if [ "$_vs_got" != "$_vs_want" ]; then
+                say "checksum mismatch (half-published?): $_vs_f"; _vs_bad=1; continue
+            fi
+        else
+            say "no checksum listed for $_vs_f"; _vs_bad=1; continue
+        fi
         case "$_vs_f" in
             *.sh)
                 if ! sh -n "$STAGE/$_vs_f" 2>/dev/null; then
                     say "will not parse: $_vs_f"; _vs_bad=1
-                fi
-                # GitHub serves a 404 as HTML with status 404; curl without -f
-                # writes it to the file. A shell file starting with "<" is that.
-                case "$(head -c 1 "$STAGE/$_vs_f" 2>/dev/null)" in
-                    '<') say "got a web page, not a script: $_vs_f"; _vs_bad=1 ;;
-                esac ;;
+                fi ;;
         esac
     done < "$STAGE/MANIFEST"
     # The front end must still know its own build, or the menu shows nothing.
@@ -131,14 +149,16 @@ install_stage() {   # $1 = the version being installed
     done < "$STAGE/MANIFEST"
     cp "$BASE/VERSION" "$BACKUP/VERSION" 2>/dev/null
     cp "$STAGE/MANIFEST" "$BACKUP/MANIFEST" 2>/dev/null
+    cp "$BASE/SHA256SUMS" "$BACKUP/SHA256SUMS" 2>/dev/null
 
     while read -r _is_f; do
         case "$_is_f" in ''|'#'*) continue ;; esac
         cp "$STAGE/$_is_f" "$BASE/$_is_f" 2>/dev/null || { say "could not install $_is_f"; return 1; }
     done < "$STAGE/MANIFEST"
-    chmod +x "$BASE"/*.sh 2>/dev/null
+    chmod +x "$BASE"/*.sh "$BASE"/dropbearmulti-* 2>/dev/null
     printf '%s\n' "$1" > "$BASE/VERSION"
     cp "$STAGE/MANIFEST" "$BASE/MANIFEST" 2>/dev/null
+    [ -f "$STAGE/SHA256SUMS" ] && cp "$STAGE/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null
     return 0
 }
 

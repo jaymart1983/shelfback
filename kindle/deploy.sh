@@ -16,7 +16,10 @@ FILES="menu.sh cwa.sh state.sh kfx-daemon.sh kfx-update.sh launch.sh kual-status
 # menu.json is what KUAL reads, if KUAL is installed; it is inert otherwise.
 # MANIFEST and VERSION are how the device knows what it is running, and are
 # what kfx-update.sh compares against GitHub.
-DATA="menu.json MANIFEST VERSION"
+DATA="menu.json MANIFEST VERSION SHA256SUMS"
+# Binaries: the static dropbear. Not syntax-checked (obviously), verified
+# by checksum instead. armel would join this list for old soft-float Kindles.
+BINS="dropbearmulti-armhf"
 # The way in without KUAL: a scriptlet in documents/, whose "# Name:" header
 # makes it appear in the library as a book you open. It only runs launch.sh.
 LAUNCHER="KFX Sync.sh"
@@ -36,13 +39,19 @@ sh -n "$HERE/menu.sh"
 # produce the same identity. Committing this file is how an update is
 # published; the device compares it with its own copy and nothing else.
 printf '%s\n' "$BUILD" > "$HERE/VERSION"
+# Checksums over exactly what the updater fetches (the MANIFEST files),
+# generated AFTER stamping so menu.sh's hash is the stamped one.
+: > "$HERE/SHA256SUMS"
+while read -r _mf; do case "$_mf" in ""|\#*) continue ;; esac
+    ( cd "$HERE" && shasum -a 256 "$_mf" ) >> "$HERE/SHA256SUMS"
+done < "$HERE/MANIFEST"
 
-for f in $FILES $DATA; do
+for f in $FILES $DATA $BINS; do
     cp "$HERE/$f" "$EXT/$f"
     cmp -s "$HERE/$f" "$EXT/$f" || { echo "copy of $f did not verify"; exit 1; }
     echo "  $f"
 done
-chmod +x "$EXT/launch.sh" "$EXT/kual-status.sh" "$EXT/kfx-update.sh" 2>/dev/null || :
+chmod +x "$EXT/launch.sh" "$EXT/kual-status.sh" "$EXT/kfx-update.sh" "$EXT"/dropbearmulti-* 2>/dev/null || :
 # The launcher carries no build number and changes almost never, so only copy
 # it when it differs -- a needless write shows up as a "new book" on the device.
 if [ -d "$DOCS" ] && ! cmp -s "$HERE/$LAUNCHER" "$DOCS/$LAUNCHER_AS"; then

@@ -22,7 +22,7 @@ BUILD=$(date +%m%d%Y.%H%M)
 # not sitting on a version number that was never published.
 if [ "${1:-}" = "--commit" ]; then
     _dirty=$(cd "$HERE/.." && git status --porcelain -- . \
-             | grep -v 'kindle/VERSION\|kindle/menu.sh' || true)
+             | grep -v 'kindle/VERSION\|kindle/menu.sh\|kindle/SHA256SUMS' || true)
     if [ -n "$_dirty" ]; then
         echo "refusing: commit these first, or they are not in the release"
         printf '%s\n' "$_dirty" | sed 's/^/  /'
@@ -39,6 +39,12 @@ sed -i '' "s/^KFX_BUILD=.*/KFX_BUILD=$BUILD   # published by publish.sh/" "$HERE
 sh -n "$HERE/menu.sh" || { echo "stamping broke menu.sh"; exit 1; }
 printf '%s\n' "$BUILD" > "$HERE/VERSION"
 
+# Regenerate checksums over the MANIFEST files, after stamping.
+: > "$HERE/SHA256SUMS"
+while read -r _mf; do case "$_mf" in ""|\#*) continue ;; esac
+    ( cd "$HERE" && shasum -a 256 "$_mf" ) >> "$HERE/SHA256SUMS"
+done < "$HERE/MANIFEST"
+
 # The check the device will make, made here first.
 _b=$(sed -n 's/^KFX_BUILD=\([0-9.]*\).*/\1/p' "$HERE/menu.sh" | head -1)
 [ "$_b" = "$BUILD" ] || { echo "stamp did not take: menu.sh says $_b"; exit 1; }
@@ -46,7 +52,7 @@ _b=$(sed -n 's/^KFX_BUILD=\([0-9.]*\).*/\1/p' "$HERE/menu.sh" | head -1)
 echo "release $BUILD"
 if [ "${1:-}" = "--commit" ]; then
     cd "$HERE/.."
-    git add kindle/VERSION kindle/menu.sh
+    git add kindle/VERSION kindle/menu.sh kindle/SHA256SUMS
     git commit -q -m "Release $BUILD"
     git push -q origin main
     echo "pushed. The CDN may serve the old files for a few minutes;"
