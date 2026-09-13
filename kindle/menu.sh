@@ -55,7 +55,7 @@ TAGW=${TAGW:-16}                # widest tag is "sent to receiver"
 # disk never byte-matches the name recorded at upload time and the book looks
 # perpetually pending. The ASIN is ASCII and survives that intact.
 # One directory holding every log, and nothing else. It is what the read-only
-# FTP server serves, so what goes in here is what anyone on the network can
+# logs live here, kept separate from books and from cwa.conf; nothing
 # read: logs and the book state, never cwa.conf, never the books themselves.
 LOGDIR=${LOGDIR:-/mnt/us/kfx-logs}
 mkdir -p "$LOGDIR" 2>/dev/null
@@ -1431,7 +1431,7 @@ poll_cmd() {
         _pc_c=$(head -1 "$CMDFILE" 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z')
         rm -f "$CMDFILE" 2>/dev/null
         case "$_pc_c" in
-            run|stop|restart-ui|update|remote-on|remote-off) echo "$_pc_c" ;;
+            run|stop|restart-ui|update) echo "$_pc_c" ;;
         esac
         return 0
     fi
@@ -1748,33 +1748,11 @@ boot_hook_state() {
     fi
 }
 
-# ---------------- remote access ----------------
-# Two FTP servers, because they answer two different needs and carry two very
-# different risks.
-#
-#   logs  READ-ONLY, always on, serving $LOGDIR and nothing else. Enough to
-#         see what the device has been doing from a laptop. busybox ftpd is
-#         read-only unless given -w, so this is not a policy we enforce -- it
-#         is a capability the server does not have.
-#
-#   dev   READ-WRITE, off by default, serving all of /mnt/us. This is how a
-#         test script gets onto the device without a cable, and it is also
-#         root access to everything on it: books, cwa.conf with the Calibre
-#         password, the lot. Its own port, its own toggle, and it says so.
-#
-# Neither reaches the network on its own. Measured 12 Sep 2026: this Kindle's
-# INPUT chain is policy DROP, accepting only port 40317 (Amazon's own service)
-# and RELATED/ESTABLISHED traffic. tcpsvd was listening and answering on
-# 127.0.0.1 for a morning while every packet from the LAN was dropped. So a
-# port is opened in the firewall when its server starts and closed when it
-# stops -- never left open without something behind it.
-REMOTE_LOG_PORT=${REMOTE_LOG_PORT:-2121}
-REMOTE_DEV_PORT=${REMOTE_DEV_PORT:-2122}
-REMOTE_PIDS=${REMOTE_PIDS:-/tmp/kfx-remote.pids}       # the dev server
-REMOTE_LOG_PIDS=${REMOTE_LOG_PIDS:-/tmp/kfx-remotelog.pids}
-REMOTE_FLAG=${REMOTE_FLAG:-${STATEDIR:-/var/local/kfx-state}/REMOTE_ON}
-REMOTE_LOG_OFF=${REMOTE_LOG_OFF:-${STATEDIR:-/var/local/kfx-state}/REMOTE_LOG_OFF}
-
+# ---------------- network access (SSH) ----------------
+# SSH is the only inbound service (plus the key-enrolment window). A port
+# is opened in the firewall when its server starts and closed when it stops
+# -- this Kindle's INPUT chain is policy DROP, so nothing is reachable
+# until then. Never left open without something behind it.
 IPTABLES=${IPTABLES:-iptables}
 NETSTAT=${NETSTAT:-netstat}
 
@@ -1817,173 +1795,11 @@ fw_is_open() {   # $1 = port
     return 1
 }
 
-# busybox ftpd needs a super-server in front of it. tcpsvd is what this device
-# has; nc can do it too on builds with -e. Verified by the port, not the pid.
-ftp_serve() {   # $1 = port, $2 = pid file, $3.. = ftpd arguments
-    _fs_port=$1; _fs_pids=$2; shift 2
-    command -v ftpd >/dev/null 2>&1 || { REMOTE_HOW="no ftpd on this device"; return 1; }
-    REMOTE_HOW=""
-    for _fs_m in tcpsvd nc; do
-        command -v "$_fs_m" >/dev/null 2>&1 || continue
-        : > "$_fs_pids"
-        case "$_fs_m" in
-            tcpsvd) setsid tcpsvd -vE 0.0.0.0 "$_fs_port" ftpd "$@" >/dev/null 2>&1 & ;;
-            nc)     setsid nc -ll -p "$_fs_port" -e ftpd "$@" >/dev/null 2>&1 & ;;
-        esac
-        echo $! >> "$_fs_pids"
-        sleep 2
-        if server_up "$_fs_port" "$_fs_pids"; then
-            REMOTE_HOW="$_fs_m"
-            fw_open "$_fs_port" || REMOTE_HOW="$_fs_m (could not open the firewall)"
-            return 0
-        fi
-        while read -r _fs_p; do kill "$_fs_p" 2>/dev/null; done < "$_fs_pids" 2>/dev/null
-        rm -f "$_fs_pids"
-    done
-    REMOTE_HOW="nothing could listen on $_fs_port"
-    return 1
-}
 
-ftp_unserve() {   # $1 = port, $2 = pid file
-    [ -s "$2" ] && while read -r _fu_p; do kill "$_fu_p" 2>/dev/null; done < "$2"
-    rm -f "$2"
-    # Close the hole even if the server was already gone: a crash between
-    # starting and stopping must not leave a port open with nothing behind it.
-    fw_close "$1"
-}
-
-# --- the read-only log server (anonymous HTTP) --------------------------
-# ftpd needs a login, so it cannot be anonymous. This serves the logs over HTTP
-# through tcpsvd instead: no account, read-only by construction (serve-logs.sh
-# only ever reads files from LOGDIR). Open a browser at http://<ip>:<port>/.
-LOGSERVER=${LOGSERVER:-$(dirname "$CONF")/serve-logs.sh}
-log_ftp_running() { server_up "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; }
-log_ftp_ours()    { pids_alive "$REMOTE_LOG_PIDS"; }
-log_ftp_wanted()  { [ ! -f "$REMOTE_LOG_OFF" ]; }
-log_ftp_stop() {
-    [ -s "$REMOTE_LOG_PIDS" ] && while read -r _lp; do kill "$_lp" 2>/dev/null; done < "$REMOTE_LOG_PIDS"
-    rm -f "$REMOTE_LOG_PIDS"
-    fw_close "$REMOTE_LOG_PORT"
-}
-log_ftp_ensure() {
-    log_ftp_wanted || { log_ftp_running && log_ftp_stop; return 0; }
-    if log_ftp_running; then
-        # Already listening: open the firewall if it is not, but only for a
-        # server we started. Anything else on this port could be serving
-        # something we would not want exposed.
-        if log_ftp_ours; then
-            fw_is_open "$REMOTE_LOG_PORT"; [ "$?" = 1 ] && fw_open "$REMOTE_LOG_PORT"
-        fi
-        return 0
-    fi
-    [ -x "$LOGSERVER" ] || { command -v tcpsvd >/dev/null 2>&1 || return 1; }
-    mkdir -p "$LOGDIR" 2>/dev/null
-    command -v tcpsvd >/dev/null 2>&1 || return 1
-    : > "$REMOTE_LOG_PIDS"
-    LOGDIR="$LOGDIR" setsid tcpsvd -vE 0.0.0.0 "$REMOTE_LOG_PORT" sh "$LOGSERVER" >/dev/null 2>&1 &
-    echo $! >> "$REMOTE_LOG_PIDS"
-    sleep 2
-    if server_up "$REMOTE_LOG_PORT" "$REMOTE_LOG_PIDS"; then
-        fw_open "$REMOTE_LOG_PORT"
-        emit "logs readable at http://$(device_ip):$REMOTE_LOG_PORT/ (anonymous, read-only)"
-        return 0
-    fi
-    while read -r _lp; do kill "$_lp" 2>/dev/null; done < "$REMOTE_LOG_PIDS" 2>/dev/null
-    rm -f "$REMOTE_LOG_PIDS"
-    return 1
-}
-
-# --- the read-write dev server ------------------------------------------
-remote_running()  { server_up "$REMOTE_DEV_PORT" "$REMOTE_PIDS"; }
-remote_wanted()   { [ -f "$REMOTE_FLAG" ]; }
-remote_want_on()  { mkdir -p "$(dirname "$REMOTE_FLAG")" 2>/dev/null; : > "$REMOTE_FLAG"; }
-remote_want_off() { rm -f "$REMOTE_FLAG" 2>/dev/null; }
-remote_stop()     { ftp_unserve "$REMOTE_DEV_PORT" "$REMOTE_PIDS"; }
-remote_start()    { ftp_serve "$REMOTE_DEV_PORT" "$REMOTE_PIDS" -w /mnt/us; }
-remote_ours() { pids_alive "$REMOTE_PIDS"; }
-remote_ensure() {
-    remote_wanted || return 0
-    if remote_running; then
-        if remote_ours; then
-            fw_is_open "$REMOTE_DEV_PORT"; [ "$?" = 1 ] && fw_open "$REMOTE_DEV_PORT"
-        fi
-        return 0
-    fi
-    if remote_start; then
-        emit "dev access: ftp://$(device_ip):$REMOTE_DEV_PORT/ read-write, via $REMOTE_HOW"
-    fi
-    return 0
-}
-
-# Who is connected, by address, from the kernel's own connection table.
-#
-# This used to count ftpd processes on the theory that tcpsvd runs one per
-# client. It does -- but a stray ftpd left behind by a crashed or killed client
-# counts just the same, and the panel then reports a connection that is not
-# there. An ESTABLISHED entry is a connection; a process is only evidence of
-# one. It also gives us the address, which is the useful part: "someone is
-# reading the logs" matters less than which machine it is.
-ftp_peers() {   # $1 = port -- one address per line, deduplicated
-    command -v "$NETSTAT" >/dev/null 2>&1 || return 0
-    "$NETSTAT" -tn 2>/dev/null | awk -v p="[:.]$1\$" '
-        $NF == "ESTABLISHED" && $4 ~ p {
-            addr = $5
-            sub(/[:.][0-9]+$/, "", addr)      # drop the peer port
-            if (addr != "") print addr
-        }' | sort -u
-}
-ftp_peer_count() { ftp_peers "$1" | grep -c . ; }
-
-# Both servers together, for the one-line "is anyone on this device" question.
-remote_clients() {
-    _rc_n=$(( $(ftp_peer_count "$REMOTE_LOG_PORT") + $(ftp_peer_count "$REMOTE_DEV_PORT") ))
-    printf '%s' "$_rc_n"
-}
-
-# The line the panel prints only when someone is actually connected.
-remote_peers_text() {
-    _rp_l=$(ftp_peers "$REMOTE_LOG_PORT" | tr '\n' ' ')
-    _rp_d=$(ftp_peers "$REMOTE_DEV_PORT" | tr '\n' ' ')
-    _rp_o=""
-    [ -n "$_rp_l" ] && _rp_o="Logs ${_rp_l%% }"
-    [ -n "$_rp_d" ] && _rp_o="${_rp_o:+$_rp_o  }Dev ${_rp_d%% }"
-    printf '%s' "$_rp_o"
-}
-
-# Both servers on one line, each saying where it is or that it is not there:
-#   Logs (2121), Dev (Off)      the usual state
-#   Logs (2121), Dev (2122)     dev access on
-#   Logs (Off),  Dev (Off)      the log server turned off in config
-# A server that is listening but firewalled says so instead of giving a port
-# nothing can connect to -- that state cost a morning once.
-remote_text() {
-    # fw_is_open returns 2 for "no iptables here, cannot tell", which is not
-    # the same as "blocked" -- only a definite 1 means the port is shut.
-    if log_ftp_running; then
-        if ! log_ftp_ours; then _rt_l="busy"        # someone else holds the port
-        else
-            fw_is_open "$REMOTE_LOG_PORT"; _rt_f=$?
-            if [ "$_rt_f" = 1 ]; then _rt_l="blocked"; else _rt_l=$REMOTE_LOG_PORT; fi
-        fi
-    elif log_ftp_wanted; then _rt_l="starting"
-    else _rt_l="Off"; fi
-
-    if remote_running; then
-        if ! remote_ours; then _rt_d="busy"
-        else
-            fw_is_open "$REMOTE_DEV_PORT"; _rt_f=$?
-            if [ "$_rt_f" = 1 ]; then _rt_d="blocked"; else _rt_d=$REMOTE_DEV_PORT; fi
-        fi
-    elif remote_wanted; then _rt_d="starting"
-    else _rt_d="Off"; fi
-
-    printf 'Logs (%s), Dev (%s)' "$_rt_l" "$_rt_d"
-}
-
-# --- creating the dev FTP account ------------------------------------------
-# ftpd authenticates against the system accounts, so the read-write dev server
-# needs a real one. This makes a locked-down user (no login shell, home in
-# /mnt/us) by writing /etc/passwd and /etc/shadow -- which live on the
+# --- the SSH dev account --------------------------------------------------
+# dropbear authenticates a key login against a real system account, so one has
+# to exist. This makes a locked-down user (home on ext3) by writing
+# /etc/passwd and /etc/shadow -- which live on the
 # read-only rootfs, so it is the one thing here that can break the device's own
 # login if it goes wrong. Hence: back up both files first, only ever APPEND or
 # replace our own line (never touch root), validate the result parses and still
@@ -2291,9 +2107,9 @@ enroll_process_pending() {
         printf '     type: %s\n' "$(printf '%s' "$_epp_key" | awk '{print $1}')"
         printf '     note: %s\n' "$(printf '%s' "$_epp_key" | awk '{print $3}')"
         printf '     %s\n' "$(pubkey_fp "$_epp_key")"
-        printf '   approve this key? type YES > '
+        printf '   approve this key? [y] > '
         read _epp_ans 2>/dev/null
-        if [ "$_epp_ans" = YES ] && ssh_add_key "$_epp_key"; then
+        if { [ "$_epp_ans" = y ] || [ "$_epp_ans" = Y ]; } && ssh_add_key "$_epp_key"; then
             echo approve > "$ENROLL_DIR/decision/$_epp_id"
             printf '   enrolled. %s key(s) now.\n' "$(ssh_keys)"
         else
@@ -2487,9 +2303,9 @@ updates_screen() {
         else
             uline "Version $_us_a is available."
         fi
-        printf '   install it now? type YES > '
+        printf '   install it now? [y] > '
         read _us_go 2>/dev/null
-        if [ "$_us_go" = YES ]; then
+        if [ "$_us_go" = y ] || [ "$_us_go" = Y ]; then
             install_update_screen
             return 0
         fi
@@ -2626,12 +2442,9 @@ settings_menu() {
         printf '   4) Recovery history\n'
         printf '   5) Restart UI now (clears stuck downloads)\n'
         printf '   6) Calibre login\n'
-        printf '   7) Dev FTP (read-write, port %s): %s\n' \
-        "$REMOTE_DEV_PORT" "$(remote_wanted && echo ON || echo off)"
-        printf '   8) FTP login: %s\n' "$(acct_exists && echo "set ($FTP_USER)" || echo "not created")"
-        printf '   9) SSH (dev, port %s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo ON || echo off)"
-        printf '  10) Enrol an SSH key over the network\n'
-        printf '  11) Automatic updates: %s\n' "$(auto_update_wanted && echo ON || echo off)"
+        printf '   7) SSH (dev, port %s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo ON || echo off)"
+        printf '   8) Enrol an SSH key over the network\n'
+        printf '   9) Automatic updates: %s\n' "$(auto_update_wanted && echo ON || echo off)"
         printf '   [enter] back\n'
         rule
         printf ' > '
@@ -2647,65 +2460,6 @@ settings_menu() {
             2) light_idle_next ;;
             6) calibre_login_menu ;;
             7) clear 2>/dev/null; echo
-               if remote_wanted; then
-                   remote_want_off; remote_stop
-                   emit "dev access: turned off"
-                   printf '   Dev access is off.\n'
-                   printf '   Logs stay readable on port %s.\n' "$REMOTE_LOG_PORT"
-               elif ! acct_exists; then
-                   printf '   No FTP login yet. Create one first with\n'
-                   printf '   option 8, then turn this on.\n'
-               else
-                   printf '   Opens a SECOND FTP server on port %s, serving\n' "$REMOTE_DEV_PORT"
-                   printf '   all of /mnt/us READ AND WRITE -- every book, and\n'
-                   printf '   cwa.conf with your Calibre password. Log in as the\n'
-                   printf '   "%s" account you created.\n\n' "$FTP_USER"
-                   printf '   The anonymous log server on %s is unaffected.\n' "$REMOTE_LOG_PORT"
-                   printf '   This stays on until you turn it off here.\n\n'
-                   printf '   type YES to turn it on > '
-                   read _ra 2>/dev/null
-                   if [ "$_ra" = "YES" ]; then
-                       remote_want_on
-                       if remote_start; then
-                           emit "dev access: ftp://$(device_ip):$REMOTE_DEV_PORT/ read-write, via $REMOTE_HOW"
-                           printf '\n   on: ftp://%s@%s:%s/\n' "$FTP_USER" "$(device_ip)" "$REMOTE_DEV_PORT"
-                           printf '   stays on, through a UI restart, until turned off\n'
-                       else
-                           printf '\n   could not start: %s\n' "$REMOTE_HOW"
-                           printf '   left ON, so the daemon will keep trying\n'
-                       fi
-                   else
-                       printf '\n   cancelled\n'
-                   fi
-               fi
-               echo; printf ' [enter] > '; read _x 2>/dev/null ;;
-            8) clear 2>/dev/null; echo
-               printf '   Creates the "%s" FTP login used by the dev server.\n' "$FTP_USER"
-               printf '   This writes /etc/passwd and /etc/shadow on the\n'
-               printf '   device. Both are backed up first, root is never\n'
-               printf '   touched, and the change is undone if anything looks\n'
-               printf '   wrong -- but it is the one setting that edits the\n'
-               printf '   system, so it asks before doing it.\n\n'
-               printf '   a dev account, home /mnt/us, for FTP and SSH.\n\n'
-               printf '   type a password for it (blank to cancel) > '
-               read _pw 2>/dev/null
-               if [ -z "$_pw" ]; then
-                   printf '\n   cancelled\n'
-               else
-                   create_ftp_user "$_pw"
-                   case "$?" in
-                       0) printf '\n   login "%s" is ready.\n' "$FTP_USER"
-                          printf '   turn on Dev FTP (option 7) to use it.\n' ;;
-                       1) printf '\n   no password-hashing tool on this device\n'
-                          printf '   (need cryptpw, mkpasswd or openssl)\n' ;;
-                       2) printf '\n   the system files are not writable here.\n'
-                          printf '   the root filesystem would not remount.\n' ;;
-                       3) printf '\n   the change did not validate and was undone.\n'
-                          printf '   nothing was altered.\n' ;;
-                   esac
-               fi
-               echo; printf ' [enter] > '; read _x 2>/dev/null ;;
-            9) clear 2>/dev/null; echo
                if ssh_wanted; then
                    ssh_want_off; ssh_stop
                    emit "ssh: turned off"
@@ -2731,16 +2485,16 @@ settings_menu() {
                    if [ "$(ssh_keys)" -eq 0 ]; then
                        printf '   No authorized keys yet, and SSH here is key-only.\n'
                        printf '   Add your PUBLIC key one of these ways, then retry:\n'
-                       printf '    - drop it at /mnt/us/import_key.pub (via dev FTP\n'
+                       printf '    - drop it at /mnt/us/import_key.pub (via USB\n'
                        printf '      or USB); I will import it, or\n'
                        printf '    - append it to %s\n' "$SSH_AUTHKEYS"
                    else
                        printf '   Starts dropbear on port %s, key-only, no root.\n' "$SSH_PORT"
                        printf '   Log in: ssh -p %s %s@%s\n\n' "$SSH_PORT" "$FTP_USER" "$(device_ip)"
                        printf '   %s authorized key(s).\n' "$(ssh_keys)"
-                       printf '   type YES to turn it on > '
+                       printf '   turn it on? [y] > '
                        read _ss 2>/dev/null
-                       if [ "$_ss" = "YES" ]; then
+                       if [ "$_ss" = y ] || [ "$_ss" = Y ]; then
                            ssh_want_on
                            if ssh_start; then
                                emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $FTP_USER)"
@@ -2757,8 +2511,8 @@ settings_menu() {
                    fi
                fi
                echo; printf ' [enter] > '; read _x 2>/dev/null ;;
-            10) enroll_window ;;
-            11) clear 2>/dev/null; echo
+            8) enroll_window ;;
+            9) clear 2>/dev/null; echo
                 if auto_update_wanted; then
                     auto_update_off
                     printf '   Automatic updates OFF.\n'
@@ -2788,9 +2542,9 @@ settings_menu() {
                echo "  queue. The monitor does this by itself when it detects"
                echo "  one; use this if you want it now."
                echo
-               printf '  type YES to restart the UI > '
+               printf '  restart the UI? [y] > '
                read _ru 2>/dev/null
-               if [ "$_ru" = "YES" ]; then
+               if [ "$_ru" = y ] || [ "$_ru" = Y ]; then
                    printf '%s manual-ui-restart\n' "$(date +%s)" >> /mnt/us/kfx-recoveries.log
                    emit "RECOVERY: UI restart requested from the menu"
                    flush_log
@@ -2827,18 +2581,9 @@ draw() {
     if monitor_on; then _nxt=$(fmt_clock "$(state_get NEXT_SYNC)"); else _nxt="--:--:--"; fi
     two ' last sync:' "$(fmt_clock "$(state_get LAST_SYNC)")" 'next sync:' "$_nxt"
     # Updates gets the full width: "update available (09122026.1100) in 5m" is
-    # longer than half a screen. The address shares a row with the FTP ports,
-    # because neither is useful without the other.
+    # longer than half a screen. The address shares its row with SSH state.
     two ' updates:'  "$(update_panel_text)" '' ''
     two ' ip:'       "$(stat_or "$(device_ip)")" 'ssh:' "$(ssh_text)"
-    two ' ftp:'      "$(remote_text)" '' ''
-    # Someone reading or writing this Kindle's storage is worth more than a
-    # column: it is a server with no password, and the owner should be able to
-    # see it is in use without going looking.
-    # Only when someone is actually on it: a line that is always there stops
-    # being read, and this one is worth reading.
-    _dr_p=$(remote_peers_text)
-    [ -n "$_dr_p" ] && printf '%s\n' "$(short " connected: $_dr_p" "$W")"
     rule
     # Books.
     two ' decrypted:' "$(stat_or "$(state_get N_SYNCED)")" \

@@ -135,8 +135,7 @@ again.
   list with each book's status: Queued, Downloading, Stuck, Waiting Part, Not
   Sent, Not KFX, Sent, Sent Success.
 - **The logs** are all in `/mnt/us/kfx-logs/`: `sync.log`, `daemon.log`,
-  `update.log`, `recoveries.log`. Read them by mounting the Kindle, or over the
-  read-only FTP server described below.
+  `update.log`, `recoveries.log`. Read them by mounting the Kindle, or over SSH.
 - **Build numbers** are the deploy time (`mmddyyyy.hhmm`), shown at the top
   right and in the log. The menu restarts the background sync when it finds it
   running an older build, so relaunching is enough after a deploy.
@@ -144,21 +143,6 @@ again.
   device, and tests the login straight away.
 - **U) Check for updates** asks the update daemon to look now; it also checks
   every couple of hours by itself. See [updating](#updating).
-- **Two FTP servers**, for two different needs and two very different risks:
-
-  | | Port | Serves | Writable | Default |
-  |---|---|---|---|---|
-  | logs | 2121 | `/mnt/us/kfx-logs` | no | **on** |
-  | dev | 2122 | all of `/mnt/us` | **yes** | off |
-
-  The log server is read-only because busybox `ftpd` is read-only unless given
-  `-w` -- not a rule enforced, a capability the server does not have. The dev
-  server is **Settings -> Dev FTP**, and it is root access to everything on the
-  device including `cwa.conf` and your Calibre password, so it asks first and
-  says so. Both run as root with no password; neither is reachable from
-  anywhere until its port is opened in the firewall, which happens when the
-  server starts and is undone when it stops. The panel shows which one is in
-  use.
 - **Settings -> SSH** runs a static **dropbear** we build from source (see
   [SSH](#ssh)), key-only, as the dev account, on port 2222. Off by default;
   once on it survives a UI restart and reboot, and the firewall opens with it.
@@ -213,9 +197,9 @@ kfx-update.sh request    # ask a running daemon to check
 
 `/mnt/us/extensions/kfx-sync/command` holds **one word**, is read once and
 deleted, and accepts only: `run`, `stop`, `restart-ui`, `update`, `remote-on`,
-`remote-off`. Write it over FTP and the daemon acts on it within a tick.
+`update`. Write it (over SSH or USB) and the daemon acts on it within a tick.
 Nothing in that vocabulary reboots the device or deletes anything: whoever can
-write the file is whoever can reach the FTP port, which is not a reason to
+write the file is whoever can already reach the device, which is not a reason to
 trust them with more.
 
 ## SSH

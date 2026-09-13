@@ -12,7 +12,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 KINDLE=${KINDLE:-/Volumes/Kindle}
 EXT="$KINDLE/extensions/kfx-sync"
 DOCS="$KINDLE/documents"
-FILES="menu.sh cwa.sh state.sh kfx-daemon.sh kfx-update.sh launch.sh kual-status.sh serve-logs.sh enroll-serve.sh"
+FILES="menu.sh cwa.sh state.sh kfx-daemon.sh kfx-update.sh launch.sh kual-status.sh enroll-serve.sh"
 # menu.json is what KUAL reads, if KUAL is installed; it is inert otherwise.
 # MANIFEST and VERSION are how the device knows what it is running, and are
 # what kfx-update.sh compares against GitHub.

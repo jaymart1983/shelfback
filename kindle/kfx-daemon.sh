@@ -305,14 +305,7 @@ loop() {
                   # this process is one of the things being replaced.
                   dlog "remote update: asking the updater to check"
                   request_update || dlog "no updater installed" ;;
-            remote-on)
-                  dlog "remote-on: opening dev FTP"
-                  remote_want_on; remote_ensure ;;
-            remote-off)
-                  # Turn off the toggle as well, or remote_ensure puts it
-                  # straight back on the next tick.
-                  dlog "remote-off: closing the way in"
-                  remote_want_off; remote_stop ;;
+
         esac
 
         # Idle unless the monitor is on or something asked for a sync. Still
@@ -342,12 +335,9 @@ loop() {
             DO_CLOUD=; DO_RESEND=; DO_PURGE=; DO_SWEEP=
             drop_lock
             maybe_recover_wedge
-        # Both servers: the framework restart that clears a jam kills
-        # anything the menu started, and the read-only log server is supposed
-        # to be there whenever the device is.
-        log_ftp_ensure
-        remote_ensure
-        ssh_ensure           # dropbear, if its toggle is on
+        ssh_ensure           # dropbear, if its toggle is on -- the framework
+                             # restart that clears a jam kills what the menu
+                             # started, so the daemon puts it back
         else
             # The menu is driving. Stay out of its way rather than racing it.
             dlog "skipped: $(lock_holder) holds the run lock"
