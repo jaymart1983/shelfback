@@ -1809,6 +1809,19 @@ LOGSERVER=${LOGSERVER:-$(dirname "$CONF")/serve-logs.sh}
 
 logsrv_running() { server_up "$LOG_PORT" "$LOG_PIDS"; }
 logsrv_ours()    { pids_alive "$LOG_PIDS"; }
+# A framework restart can orphan the log server: it keeps serving the port but
+# the pid we recorded is gone, so it stops counting as ours (and stop cannot
+# reach it, and the panel shows it wrong). Re-record the real listener from the
+# port itself so it is tracked again -- no restart, no dropped connections.
+logsrv_adopt() {
+    logsrv_ours && return 0
+    port_listening "$LOG_PORT" || return 1
+    command -v fuser >/dev/null 2>&1 || return 1
+    _lad=$(fuser "$LOG_PORT/tcp" 2>/dev/null | tr -cs '0-9' '\n' | grep -E '^[0-9]+$')
+    [ -n "$_lad" ] || return 1
+    printf '%s\n' $_lad > "$LOG_PIDS"
+    logsrv_ours
+}
 logsrv_wanted()  { [ ! -f "$LOG_OFF" ]; }
 logsrv_want_on() { rm -f "$LOG_OFF" 2>/dev/null; }
 logsrv_want_off(){ mkdir -p "$(dirname "$LOG_OFF")" 2>/dev/null; : > "$LOG_OFF"; }
@@ -1820,8 +1833,9 @@ logsrv_stop() {
 logsrv_ensure() {
     logsrv_wanted || { logsrv_running && logsrv_stop; return 0; }
     if logsrv_running; then
-        # Already up: open the firewall if it is not, but only for a server we
-        # started -- never for something else that happens to hold the port.
+        logsrv_adopt    # re-track it if a restart orphaned it
+        # Open the firewall if it is not, but only for a server we own -- never
+        # for something else that merely happens to hold the port.
         if logsrv_ours; then fw_is_open "$LOG_PORT"; [ "$?" = 1 ] && fw_open "$LOG_PORT"; fi
         return 0
     fi
@@ -1842,8 +1856,13 @@ logsrv_ensure() {
 }
 logsrv_text() {
     if logsrv_running; then
-        if ! logsrv_ours; then printf 'busy'
-        else fw_is_open "$LOG_PORT"; [ "$?" = 1 ] && printf 'blocked' || printf 'on'; fi
+        if logsrv_ours; then
+            fw_is_open "$LOG_PORT"; [ "$?" = 1 ] && printf 'blocked' || printf 'on'
+        elif fw_is_open "$LOG_PORT"; then
+            printf 'on'          # up and reachable through our rule -- ours, pid just untracked
+        else
+            printf 'busy'        # someone else holds the port
+        fi
     elif logsrv_wanted; then printf 'starting'
     else printf 'off'
     fi
