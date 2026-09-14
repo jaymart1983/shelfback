@@ -2401,6 +2401,22 @@ request_install() {
 # broken.
 uline() { printf '   %s\n' "$(short "$1" $((W - 4)))"; }
 
+# Offer to install a known-available version. Returns 0 if the install was
+# launched (the caller should return), 1 if the user declined.
+update_offer_install() {   # $1 = version
+    echo
+    if auto_update_wanted; then
+        uline "Version $1 will install $(update_due_text) (auto)."
+    else
+        uline "Version $1 is available."
+    fi
+    printf '   install it now? [y] > '
+    read _uoi 2>/dev/null
+    { [ "$_uoi" = y ] || [ "$_uoi" = Y ]; } || return 1
+    install_update_screen
+    return 0
+}
+
 updates_screen() {
     clear 2>/dev/null
     rule; printf ' updates\n'; rule; echo
@@ -2410,10 +2426,17 @@ updates_screen() {
         echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
     fi
     uline "Installed: $(stat_or "$(installed_version)")"
-    _us_a=$(update_available)
-    [ -n "$_us_a" ] && uline "Available: $_us_a"
     uline "Source:    $UPDATE_URL/VERSION"
     echo
+    # The background daemon already checks on its own, so we often know an
+    # update is waiting the moment this screen opens. Offer it straight away
+    # rather than making the user sit through a re-check that can only tell them
+    # the same thing.
+    _us_a=$(update_available)
+    if [ -n "$_us_a" ]; then
+        update_offer_install "$_us_a" && return 0
+        echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
+    fi
     uline "Checking for Updates"
     echo
     if ! request_update; then
@@ -2432,20 +2455,7 @@ updates_screen() {
     done
     uline "$(stat_or "$(update_status)")"
     _us_a=$(update_available)
-    if [ -n "$_us_a" ]; then
-        echo
-        if auto_update_wanted; then
-            uline "Version $_us_a will install $(update_due_text) (auto)."
-        else
-            uline "Version $_us_a is available."
-        fi
-        printf '   install it now? [y] > '
-        read _us_go 2>/dev/null
-        if [ "$_us_go" = y ] || [ "$_us_go" = Y ]; then
-            install_update_screen
-            return 0
-        fi
-    fi
+    [ -n "$_us_a" ] && update_offer_install "$_us_a" && return 0
     echo; printf ' [enter] > '; read _x 2>/dev/null
 }
 
