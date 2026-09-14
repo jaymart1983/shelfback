@@ -2087,11 +2087,24 @@ mkdir -p "$SSH_HOME" "$SSH_DIR" 2>/dev/null
     SSH_HOW="dropbear did not stay up"; rm -f "$SSH_PID"; return 1
 }
 
+# dropbear refuses authorized_keys if ~/.ssh is writable by group/other. A
+# lab126_gui restart (which the jam recovery does routinely) resets those
+# permissions, silently killing key auth while dropbear itself keeps running.
+# Re-assert them here so a framework restart self-heals within one tick.
+ssh_harden_perms() {
+    [ -d "$SSH_DIR" ] || return 0
+    chmod 755 "$SSH_HOME" 2>/dev/null
+    chmod 700 "$SSH_DIR" 2>/dev/null
+    [ -f "$SSH_AUTHKEYS" ] && chmod 600 "$SSH_AUTHKEYS" 2>/dev/null
+    chown -R "$SSH_USER" "$SSH_HOME" 2>/dev/null
+}
+
 ssh_ensure() {
     ssh_wanted || return 0
     if ssh_running; then
         if ssh_ours; then fw_is_open "$SSH_PORT"; [ "$?" = 1 ] && fw_open "$SSH_PORT"; fi
         ssh_scp_link 2>/dev/null || :   # keep the scp convenience link in place
+        ssh_harden_perms                # a framework restart can reset ~/.ssh perms
         return 0
     fi
     if ssh_start; then emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $SSH_USER)"; fi
