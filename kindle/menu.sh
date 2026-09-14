@@ -1368,6 +1368,7 @@ light_off() {
     case "$_fl" in ''|*[!0-9]*) return 0 ;; esac
     [ "$_fl" -gt 0 ] || return 0          # already off; leave it alone
     FL_SAVED=$_fl
+    state_set FL_SAVED "$_fl"             # persist: a menu reload must still be able to undim
     lipc-set-prop com.lab126.powerd flIntensity 0 >/dev/null 2>&1
 }
 light_restore() {
@@ -1375,6 +1376,19 @@ light_restore() {
     [ "$FL_SAVED" -gt 0 ] || return 0
     lipc-set-prop com.lab126.powerd flIntensity "$FL_SAVED" >/dev/null 2>&1
     FL_SAVED=""
+    state_set FL_SAVED ""                 # dimmed value consumed
+}
+# Recover a frontlight a previous instance dimmed but could not restore -- a
+# reload (update install, jam-recovery framework restart) while the light was
+# off drops the in-memory FL_SAVED, and it would otherwise stay dark with
+# nothing able to bring it back. Called once at startup.
+light_recover() {
+    _lr=$(state_get FL_SAVED)
+    case "$_lr" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_lr" -gt 0 ] || { state_set FL_SAVED ""; return 0; }
+    _now=$(lipc-get-prop com.lab126.powerd flIntensity 2>/dev/null)
+    case "$_now" in 0) lipc-set-prop com.lab126.powerd flIntensity "$_lr" >/dev/null 2>&1 ;; esac
+    state_set FL_SAVED ""
 }
 
 awake_on()  { lipc-set-prop com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1; }
@@ -3211,6 +3225,7 @@ flush_log
 # setting could never take effect. A 15s wake costs nothing -- it only
 # repaints when something actually changed.
 UI_STEP=15
+light_recover      # undim a light a prior instance left off across a reload
 _redraw=1; _idle=0; _since=0
 while :; do
     # Before drawing, not after: if the code on disk is newer than this
