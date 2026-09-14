@@ -1391,12 +1391,61 @@ light_recover() {
     state_set FL_SAVED ""
 }
 
+# --- tap to wake -----------------------------------------------------------
+# The menu only wakes the light on a keypress (the read loop reads the keyboard).
+# On a touch device that is surprising, so a small background watcher reads the
+# touch panel and undims on a tap too. It needs root to read /dev/input (the
+# menu and daemon have it); as the unprivileged ssh user it silently no-ops, so
+# key-wake still works. Reading is passive -- no EVIOCGRAB -- so the framework
+# still receives the touches.
+TOUCH_FLAG=${TOUCH_FLAG:-/tmp/kfx-touch}
+TOUCH_WPID=${TOUCH_WPID:-/tmp/kfx-touchwaker.pid}
+# The multitouch panel's event node, read from the kernel's own list so we do
+# not hard-code eventN (it can differ across firmwares).
+touch_dev() {
+    # Note: the handler is written "Handlers=event1", so match the event token
+    # as a substring rather than a whole field.
+    awk '
+      /^N: Name=/ { n=$0 }
+      /^H: Handlers=/ {
+        if (n ~ /pt_mt/ || tolower(n) ~ /touch/) {
+          if (match($0, /event[0-9]+/)) { print "/dev/input/" substr($0, RSTART, RLENGTH); exit }
+        }
+      }' /proc/bus/input/devices 2>/dev/null
+}
+touch_waker_start() {
+    # never leave two watchers: kill one a prior (pre-reload) instance left
+    [ -s "$TOUCH_WPID" ] && kill "$(cat "$TOUCH_WPID" 2>/dev/null)" 2>/dev/null
+    rm -f "$TOUCH_WPID" "$TOUCH_FLAG"
+    _twd=$(touch_dev); [ -n "$_twd" ] || _twd=/dev/input/event1
+    [ -r "$_twd" ] || return 0            # not root / no touch node: keys still wake
+    command -v dd >/dev/null 2>&1 || return 0
+    (
+        while :; do
+            # Blocks with no CPU until a touch arrives; the read size need not
+            # match the event struct exactly -- any data means activity.
+            if dd if="$_twd" bs=16 count=1 >/dev/null 2>&1; then
+                light_recover                 # undim now (uses the persisted value)
+                : > "$TOUCH_FLAG" 2>/dev/null # tell the loop to reset its idle timer
+            else
+                sleep 2
+            fi
+        done
+    ) &
+    echo $! > "$TOUCH_WPID"
+}
+touch_waker_stop() {
+    [ -s "$TOUCH_WPID" ] && kill "$(cat "$TOUCH_WPID" 2>/dev/null)" 2>/dev/null
+    rm -f "$TOUCH_WPID" "$TOUCH_FLAG"
+}
+
 awake_on()  { lipc-set-prop com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1; }
 awake_off() { lipc-set-prop com.lab126.powerd preventScreenSaver 0 >/dev/null 2>&1; }
 # Leave the background helper alone: if the monitor is on it keeps syncing.
 close_only() {
     clear 2>/dev/null
     light_restore
+    touch_waker_stop
     flush_log; rm -f "$SPOOL"; awake_off
     if monitor_on; then
         echo "Closed. Daemon still running, monitor still syncing."
@@ -1416,12 +1465,13 @@ quit_all() {
     note_monitor
     sh "$DAEMON" stop >/dev/null 2>&1
     light_restore
+    touch_waker_stop
     flush_log; rm -f "$SPOOL"; awake_off
     echo "Daemon and monitor stopped."
     exit 0
 }
 
-cleanup() { light_restore; flush_log; rm -f "$SPOOL"; awake_off
+cleanup() { light_restore; touch_waker_stop; flush_log; rm -f "$SPOOL"; awake_off
             clear 2>/dev/null; echo "KFX Sync stopped."; exit 0; }
 trap cleanup INT TERM HUP
 
@@ -3226,11 +3276,15 @@ flush_log
 # repaints when something actually changed.
 UI_STEP=15
 light_recover      # undim a light a prior instance left off across a reload
+touch_waker_start  # let a screen tap wake the light too, not just a keypress
 _redraw=1; _idle=0; _since=0
 while :; do
     # Before drawing, not after: if the code on disk is newer than this
     # process, the screen we are about to paint is the old one.
     reload_if_stale
+    # A tap (seen by the background watcher) counts as activity: reset the idle
+    # timer so the light it just undimmed does not dim straight back.
+    [ -f "$TOUCH_FLAG" ] && { rm -f "$TOUCH_FLAG"; _idle=0; }
     [ "$_redraw" = 1 ] && draw
     _redraw=0
     if read -t "$UI_STEP" choice 2>/dev/null; then
