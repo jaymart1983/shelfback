@@ -1749,7 +1749,7 @@ boot_hook_state() {
 }
 
 # ---------------- network access (SSH) ----------------
-# SSH is the only inbound service (plus the key-enrolment window). A port
+# SSH is the only inbound service (plus the key-enrollment window). A port
 # is opened in the firewall when its server starts and closed when it stops
 # -- this Kindle's INPUT chain is policy DROP, so nothing is reachable
 # until then. Never left open without something behind it.
@@ -2041,11 +2041,28 @@ all_ssh_pids() {
 # Start dropbear: key-only (-s), no root login (-w), its own host key (-r),
 # our port (-p), pidfile (-P). It daemonizes itself; setsid so a framework
 # restart cannot take it down with the menu.
+# scp over this dropbear needs an `scp` in the session PATH, which is only
+# /usr/bin:/bin (both on the read-only rootfs) -- the client runs `scp -t` on
+# the device. dropbearmulti carries the scp applet, so we point /usr/bin/scp at
+# it, using the same rootfs remount the account creation uses. Idempotent, and
+# it only remounts when the link is missing or stale.
+SCP_LINK=${SCP_LINK:-/usr/bin/scp}
+ssh_scp_link() {
+    _sl_bin=$(ssh_bin)
+    [ -f "$_sl_bin" ] || return 1
+    [ "$(readlink "$SCP_LINK" 2>/dev/null)" = "$_sl_bin" ] && return 0   # already right
+    $REMOUNT_RW 2>/dev/null || return 1
+    ln -sf "$_sl_bin" "$SCP_LINK" 2>/dev/null; _sl_ok=$?
+    $REMOUNT_RO 2>/dev/null
+    return $_sl_ok
+}
+
 ssh_start() {
     _hb=$(ssh_bin)
     [ -f "$_hb" ] || { SSH_HOW="no dropbear binary (need $(basename "$_hb"))"; return 1; }
     chmod +x "$_hb" 2>/dev/null
     ensure_ssh_account || { SSH_HOW="could not create the dev account (system not writable?)"; return 1; }
+    ssh_scp_link 2>/dev/null || :   # best-effort: scp convenience, never blocks SSH
     ssh_ensure_hostkey || { SSH_HOW="could not generate a host key"; return 1; }
 mkdir -p "$SSH_HOME" "$SSH_DIR" 2>/dev/null
     ssh_migrate_keys
@@ -2074,6 +2091,7 @@ ssh_ensure() {
     ssh_wanted || return 0
     if ssh_running; then
         if ssh_ours; then fw_is_open "$SSH_PORT"; [ "$?" = 1 ] && fw_open "$SSH_PORT"; fi
+        ssh_scp_link 2>/dev/null || :   # keep the scp convenience link in place
         return 0
     fi
     if ssh_start; then emit "ssh: dropbear on $(device_ip):$SSH_PORT (key-only, as $SSH_USER)"; fi
@@ -2118,7 +2136,7 @@ ENROLL_SERVE=${ENROLL_SERVE:-$(dirname "$CONF")/enroll-serve.sh}
 # owner can see later what was let in and revoke it.
 ENROLL_REG=${ENROLL_REG:-${STATEDIR:-/var/local/kfx-state}/enrolled}
 
-# Record an enrolment.
+# Record an enrollment.
 enroll_register() {   # $1 name  $2 ip  $3 full public key line
     mkdir -p "$STATEDIR" 2>/dev/null
     printf '%s\t%s\t%s\t%s\n' \
@@ -2198,7 +2216,7 @@ enroll_process_pending() {
         _epp_ip=$(sed -n 's/^ip=//p' "$_epp_f" | head -1)
         _epp_key=$(sed -n 's/^key=//p' "$_epp_f" | head -1)
         echo
-        printf '   enrol "%s"?\n' "${_epp_name:-?}"
+        printf '   enroll "%s"?\n' "${_epp_name:-?}"
         printf '     from: %s\n' "${_epp_ip:-unknown}"
         printf '     type: %s\n' "$(printf '%s' "$_epp_key" | awk '{print $1}')"
         printf '     %s\n' "$(pubkey_fp "$_epp_key")"
@@ -2226,7 +2244,7 @@ enroll_process_pending() {
 
 enroll_window() {
     clear 2>/dev/null
-    rule; printf ' enrol an SSH key\n'; rule; echo
+    rule; printf ' enroll an SSH key\n'; rule; echo
     if ! ssh_have_bin; then
         printf '   the SSH binary is not installed yet.\n'
         echo; printf ' [enter] > '; read _x 2>/dev/null; return 0
@@ -2242,16 +2260,18 @@ enroll_window() {
     printf '   It can make a key in the browser (download the private half) or\n'
     printf '   take one you paste. Only the public key reaches the Kindle.\n'
     printf '   Approve it here after checking the fingerprint matches.\n'
-    printf '   The endpoint is open only while this screen is. q to close.\n'
+    printf '   The endpoint is open only while this screen is.\n'
+    printf '\n   waiting.....  [enter] to stop\n'
     while :; do
         enroll_process_pending
-        printf '\n   waiting for a name...  [enter] refresh, q to stop > '
-        read -t 5 _ew 2>/dev/null
-        case "$_ew" in q|Q) break ;; esac
+        # A request was just handled -- show we are back to waiting, once.
+        [ "${_epp_n:-0}" -gt 0 ] && printf '\n   waiting.....  [enter] to stop\n'
+        # Poll every few seconds; any key/enter ends the loop.
+        read -t 5 _ew 2>/dev/null && break
     done
     enroll_stop
     rm -rf "$ENROLL_DIR"
-    printf '\n   enrolment closed.\n'
+    printf '\n   enrollment closed.\n'
     echo; printf ' [enter] > '; read _x 2>/dev/null
 }
 
@@ -2559,7 +2579,7 @@ settings_menu() {
         printf '   5) Restart UI now (clears stuck downloads)\n'
         printf '   6) Calibre login\n'
         printf '   7) SSH (%s): %s\n' "$SSH_PORT" "$(ssh_wanted && echo On || echo Off)"
-        printf '   8) Enrol an SSH key over the network\n'
+        printf '   8) Enroll an SSH key over the network\n'
         printf '   9) Automatic updates: %s\n' "$(auto_update_wanted && echo On || echo Off)"
         printf '  10) HTTP Log (%s): %s\n' "$LOG_PORT" "$(logsrv_wanted && echo On || echo Off)"
         printf '   [enter] back\n'

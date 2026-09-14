@@ -1,5 +1,5 @@
 #!/bin/sh
-# enroll-serve.sh -- attended SSH enrolment over HTTP. One copy per connection
+# enroll-serve.sh -- attended SSH enrollment over HTTP. One copy per connection
 # (run by tcpsvd). The requester generates its OWN keypair -- in the browser
 # (Generate button) or with ssh-keygen -- and sends only the PUBLIC key plus a
 # name. The owner approves it on the Kindle after checking the fingerprint. The
@@ -34,7 +34,7 @@ form_page() {
     send "HTTP/1.0 200 OK" "text/html; charset=utf-8" <<'HTML'
 <!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>shelfback -- enrol an SSH key</title>
+<title>shelfback -- enroll an SSH key</title>
 <style>
  body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:2.5rem auto;padding:0 1rem;color:#222}
  h1{font-size:1.3rem} label{font-weight:600;display:block;margin:.8rem 0 .2rem}
@@ -45,7 +45,7 @@ form_page() {
  code{padding:.1rem .3rem} .muted{color:#666;font-size:.9rem} .hidden{display:none}
  .fp{font-family:ui-monospace,monospace;font-size:.85rem;background:#eef;padding:.5rem;word-break:break-all}
 </style>
-<h1>Enrol an SSH key</h1>
+<h1>Enroll an SSH key</h1>
 <p class=muted>Your computer makes its own key. Only the <b>public</b> half is sent
 to the Kindle -- the private half never leaves this page. The person at the Kindle
 checks the fingerprint and approves.</p>
@@ -67,7 +67,7 @@ checks the fingerprint and approves.</p>
  <div class=fp id=fp></div>
 </div>
 
-<p><button id=go>Request enrolment</button> <span id=status class=muted></span></p>
+<p><button id=go>Request enrollment</button> <span id=status class=muted></span></p>
 
 <details><summary class=muted>Prefer the command line?</summary>
 <pre>ssh-keygen -t ed25519 -f kfx_key -N "" -C laptop
